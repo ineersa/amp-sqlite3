@@ -13,10 +13,14 @@ declare(strict_types=1);
 
 namespace Fabpot\Amp\Sqlite\Internal;
 
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\ForbidCloning;
 use Amp\ForbidSerialization;
 use Amp\Parallel\Context\Context;
 use Amp\Sync\LocalMutex;
+use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteException;
 use Fabpot\Amp\Sqlite\SqliteQueryError;
 
@@ -29,6 +33,14 @@ final class WorkerChannel
 {
     use ForbidCloning;
     use ForbidSerialization;
+
+    /**
+     * Upper bound for a graceful child shutdown when the caller does not supply a tighter cancellation.
+     *
+     * A peer that withholds the close reply, or a join that never observes exit, is force-terminated
+     * when this budget expires. Callers may pass a shorter cancellation to close().
+     */
+    public const float DEFAULT_CLOSE_TIMEOUT_SECONDS = 5.0;
 
     private readonly LocalMutex $mutex;
     private int $nextRequestId = 1;
@@ -91,29 +103,52 @@ final class WorkerChannel
     /**
      * Asks the child process to close the database and waits for it to exit.
      *
+     * The wait is bounded by {@see self::DEFAULT_CLOSE_TIMEOUT_SECONDS}. Pass a cancellation to
+     * tighten that budget. The same budget independently force-terminates a suspended send,
+     * receive, or join. Cancellation or any shutdown failure force-terminates the child and
+     * leaves process reaping to Amp; this method never joins after force termination.
+     *
      * @throws WorkerFailure If the child process did not shut down cleanly
      */
-    public function close(): void
+    public function close(?Cancellation $cancellation = null): void
     {
-        $lock = $this->mutex->acquire();
+        $budget = self::closeBudget($cancellation);
+        $subscription = $budget->subscribe($this->kill(...));
+        $lock = null;
 
         try {
+            $lock = $this->mutex->acquire();
             if ($this->context->isClosed()) {
                 return;
             }
 
             $this->context->send(['id' => $this->nextRequestId++, 'operation' => 'close']);
-            $this->context->receive();
-            $this->context->join();
+            $this->context->receive($budget);
+            $this->context->join($budget);
+            $this->context->close();
         } catch (\Throwable $exception) {
+            $this->kill();
+            if ($exception instanceof CancelledException || $budget->isRequested()) {
+                throw new WorkerFailure(
+                    'The SQLite child process close was cancelled',
+                    previous: $exception instanceof CancelledException
+                        ? $exception
+                        : new CancelledException(previous: $exception),
+                );
+            }
+
             throw new WorkerFailure('The SQLite child process stopped unexpectedly', previous: $exception);
         } finally {
-            $lock->release();
+            $budget->unsubscribe($subscription);
+            $lock?->release();
         }
-
-        $this->context->close();
     }
 
+    /**
+     * Force-terminates the child process without waiting for a close reply or exit result.
+     *
+     * Amp retains process ownership after the IPC channels close, so this method does not join.
+     */
     public function kill(): void
     {
         if ($this->context->isClosed()) {
@@ -121,9 +156,15 @@ final class WorkerChannel
         }
 
         $this->context->close();
-        try {
-            $this->context->join();
-        } catch (\Throwable) {
+    }
+
+    private static function closeBudget(?Cancellation $cancellation): Cancellation
+    {
+        $timeout = new TimeoutCancellation(self::DEFAULT_CLOSE_TIMEOUT_SECONDS);
+        if ($cancellation === null) {
+            return $timeout;
         }
+
+        return new CompositeCancellation($timeout, $cancellation);
     }
 }
