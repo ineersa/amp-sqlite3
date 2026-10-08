@@ -97,6 +97,8 @@ Options with dedicated methods, such as `journal_mode`, `synchronous`, and `fore
 
 A single connection is a good fit for sequential work and is required for `:memory:` databases. Operations on one connection run one at a time.
 
+`close()` asks the child process to exit and waits for that shutdown with a five-second budget. If the budget expires, the child is force-terminated. `SqliteConnector` returns a `SqliteCancellableConnection`, so callers that already own a tighter deadline can pass that cancellation to `close()`.
+
 Use `SqliteConnectionPool` when independent fibers need to query the same file database concurrently:
 
 ```php

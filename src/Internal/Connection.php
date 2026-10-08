@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace Fabpot\Amp\Sqlite\Internal;
 
+use Amp\Cancellation;
 use Amp\DeferredFuture;
 use Amp\ForbidCloning;
 use Amp\ForbidSerialization;
@@ -21,8 +22,8 @@ use Amp\Sync\Lock;
 use Fabpot\Amp\Sqlite\SqliteBlob;
 use Fabpot\Amp\Sqlite\SqliteBlobMode;
 use Fabpot\Amp\Sqlite\SqliteBlobStream;
+use Fabpot\Amp\Sqlite\SqliteCancellableConnection;
 use Fabpot\Amp\Sqlite\SqliteConfig;
-use Fabpot\Amp\Sqlite\SqliteConnection;
 use Fabpot\Amp\Sqlite\SqliteConnectionException;
 use Fabpot\Amp\Sqlite\SqliteException;
 use Fabpot\Amp\Sqlite\SqliteResult;
@@ -33,7 +34,7 @@ use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 use Revolt\EventLoop;
 
 /** @internal */
-final class Connection implements SqliteConnection
+final class Connection implements SqliteCancellableConnection
 {
     use ForbidCloning;
     use ForbidSerialization;
@@ -156,7 +157,7 @@ final class Connection implements SqliteConnection
         return $this->channel->getLastUsedAt();
     }
 
-    public function close(): void
+    public function close(?Cancellation $cancellation = null): void
     {
         if ($this->closed) {
             return;
@@ -177,7 +178,7 @@ final class Connection implements SqliteConnection
         $this->closeDependents();
         $lock = $this->leases->acquireConnection();
         try {
-            $this->channel->close();
+            $this->channel->close($cancellation);
         } catch (WorkerFailure) {
             $this->forceClose();
 

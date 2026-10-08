@@ -2,6 +2,7 @@
 
 ## 1.1.0
 
+- Bound graceful connection close so a child that withholds its close reply cannot hang the parent forever; `SqliteCancellableConnection` accepts a tighter cancellation
 - Count only rows changed directly by INSERT, UPDATE, and DELETE statements, so trigger writes, virtual table internals, and CREATE TABLE AS SELECT no longer count
 - Fix pooled results losing their last row and holding their connection when read with fetchRow()
 - Roll back abandoned nested transactions instead of blocking their parent transaction
