@@ -1206,6 +1206,7 @@ final class SqliteQueryTest extends TestCase
             'foreign_keys' => true,
             'busy_timeout' => 5_000,
             'batch_size' => $batchSize,
+            'statement_cache_size' => 64,
             'trusted_schema' => false,
             'extended_result_codes' => true,
             'pragmas' => [],

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Reuse idle native statements for repeated direct query and execute calls through a bounded exact-SQL cache (default 64, SQL capped at 4,096 bytes; `0` disables)
+
 ## 1.1.0
 
 - Bound graceful connection close so a child that withholds its close reply cannot hang the parent forever; `SqliteCancellableConnection` accepts a tighter cancellation

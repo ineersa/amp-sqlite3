@@ -39,6 +39,7 @@ final class SqliteConfig extends SqlConfig
     private int $busyTimeout = 5000;
     private bool $trustedSchema = false;
     private int $batchSize = 100;
+    private int $statementCacheSize = 64;
     private SqliteTransactionMode $transactionMode = SqliteTransactionMode::Deferred;
     private bool $extendedResultCodes = true;
 
@@ -175,6 +176,23 @@ final class SqliteConfig extends SqlConfig
 
         $config = clone $this;
         $config->batchSize = $batchSize;
+
+        return $config;
+    }
+
+    public function getStatementCacheSize(): int
+    {
+        return $this->statementCacheSize;
+    }
+
+    public function withStatementCacheSize(int $statementCacheSize): self
+    {
+        if ($statementCacheSize < 0) {
+            throw new \InvalidArgumentException('Statement cache size must not be negative');
+        }
+
+        $config = clone $this;
+        $config->statementCacheSize = $statementCacheSize;
 
         return $config;
     }
