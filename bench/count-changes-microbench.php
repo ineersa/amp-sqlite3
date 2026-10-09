@@ -20,6 +20,7 @@ declare(strict_types=1);
 
 const MIN_MEASURE_SECONDS = 0.2;
 const WARMUP_ITERATIONS = 2_000;
+const REPEATED_PAIRS = 7;
 
 final class CountChangesReader
 {
@@ -244,17 +245,20 @@ function main(): int
     $modes = ['cached_execute_fetch', 'query_single'];
     $results = [];
 
-    foreach (pairs() as $index => $pair) {
-        $orderedModes = $index % 2 === 0 ? $modes : array_reverse($modes);
-        $pairResult = [
-            'name' => $pair['name'],
-            'mode_order' => $orderedModes,
-            'modes' => [],
-        ];
-        foreach ($orderedModes as $mode) {
-            $pairResult['modes'][$mode] = measure($mode, $pair['setup'], $pair['body']);
+    for ($repetition = 0; $repetition < REPEATED_PAIRS; ++$repetition) {
+        foreach (pairs() as $index => $pair) {
+            $orderedModes = ($index + $repetition) % 2 === 0 ? $modes : array_reverse($modes);
+            $pairResult = [
+                'pair' => $repetition + 1,
+                'name' => $pair['name'],
+                'mode_order' => $orderedModes,
+                'modes' => [],
+            ];
+            foreach ($orderedModes as $mode) {
+                $pairResult['modes'][$mode] = measure($mode, $pair['setup'], $pair['body']);
+            }
+            $results[] = $pairResult;
         }
-        $results[] = $pairResult;
     }
 
     $payload = [
@@ -266,6 +270,7 @@ function main(): int
         'xdebug_mode' => getenv('XDEBUG_MODE') ?: null,
         'min_measure_seconds' => MIN_MEASURE_SECONDS,
         'warmup_iterations' => WARMUP_ITERATIONS,
+        'repeated_pairs_per_workload' => REPEATED_PAIRS,
         'settings' => [
             'journal_mode' => 'MEMORY',
             'synchronous' => 'OFF',
