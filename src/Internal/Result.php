@@ -74,7 +74,7 @@ final class Result implements SqliteResult, \IteratorAggregate
         }
 
         $this->closed = true;
-        EventLoop::queue(self::dispose(...), $this->resultId, $this->close, $this->lease, $this->onClose);
+        EventLoop::queue(self::dispose(...), $this->resultId, $this->close, $this->lease, $this->onClose, $this->exhausted);
     }
 
     public function fetchRow(): ?array
@@ -154,7 +154,8 @@ final class Result implements SqliteResult, \IteratorAggregate
         $this->explicitlyClosed = true;
 
         try {
-            if ($this->resultId !== null && $this->close !== null) {
+            // The worker already finalized an exhausted cursor; only live cursors need closeResult.
+            if ($this->resultId !== null && $this->close !== null && !$this->exhausted) {
                 ($this->close)($this->resultId);
             }
         } finally {
@@ -217,10 +218,10 @@ final class Result implements SqliteResult, \IteratorAggregate
      * @param null|\Closure(int):void $close
      * @param DeferredFuture<null> $onClose
      */
-    private static function dispose(?int $resultId, ?\Closure $close, ?Lock $lease, DeferredFuture $onClose): void
+    private static function dispose(?int $resultId, ?\Closure $close, ?Lock $lease, DeferredFuture $onClose, bool $exhausted): void
     {
         try {
-            if ($resultId !== null && $close !== null) {
+            if ($resultId !== null && $close !== null && !$exhausted) {
                 $close($resultId);
             }
         } finally {
