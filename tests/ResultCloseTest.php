@@ -78,6 +78,8 @@ final class ResultCloseTest extends TestCase
     {
         $closes = 0;
         $fetches = 0;
+        $releases = 0;
+        $completed = 0;
         $result = new Result(
             [['value' => 1]],
             null,
@@ -90,24 +92,35 @@ final class ResultCloseTest extends TestCase
                 ++$fetches;
 
                 return [
-                    'rows' => [['value' => 2]],
+                    'rows' => [['value' => 2], ['value' => 3]],
                     'exhausted' => true,
                 ];
             },
             static function () use (&$closes): void {
                 ++$closes;
             },
-            null,
+            new Lock(static function () use (&$releases): void {
+                ++$releases;
+            }),
         );
+        $result->onClose(static function () use (&$completed): void {
+            ++$completed;
+        });
 
         self::assertSame(['value' => 1], $result->fetchRow());
         self::assertSame(['value' => 2], $result->fetchRow());
-        self::assertNull($result->fetchRow());
+        self::assertFalse($result->isClosed());
+        self::assertSame(0, $releases);
         $result->close();
 
         self::assertSame(1, $fetches);
         self::assertSame(0, $closes);
         self::assertTrue($result->isClosed());
+        $result->close();
+        unset($result);
+        self::drainQueuedCallbacks();
+        self::assertSame(1, $releases);
+        self::assertSame(1, $completed);
     }
 
     public function testClosingStreamingResultSendsOneRemoteClose(): void

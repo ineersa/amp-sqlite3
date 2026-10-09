@@ -5,6 +5,7 @@
 - Reuse idle native statements for repeated direct query and execute calls through a bounded exact-SQL cache (default 64, SQL capped at 4,096 bytes; `0` disables)
 - Send transaction control as a typed worker request instead of the generic execute path
 - Skip remote cursor-close requests when the worker has already exhausted the result
+- Avoid duplicate validation, resets, and boundary scans in implicit statement execution while retaining live DML guards and invalidation
 
 ## 1.1.0
 

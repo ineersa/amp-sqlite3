@@ -57,13 +57,19 @@ final class SqliteStatementCacheTest extends TestCase
 
     public function testCapacityEvictsLeastRecentlyUsedIdleEntry(): void
     {
-        $worker = $this->createWorker(statementCacheSize: 1);
+        $worker = $this->createWorker(statementCacheSize: 2);
 
         $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 1 AS value', 'params' => [], 'bind_parameters' => true]);
         self::assertSame(1, $worker->getUserStatementPreparations());
 
         $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 2 AS value', 'params' => [], 'bind_parameters' => true]);
         self::assertSame(2, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 1 AS value', 'params' => [], 'bind_parameters' => true]);
+        self::assertSame(2, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 3 AS value', 'params' => [], 'bind_parameters' => true]);
+        self::assertSame(3, $worker->getUserStatementPreparations());
 
         $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 1 AS value', 'params' => [], 'bind_parameters' => true]);
         self::assertSame(3, $worker->getUserStatementPreparations());
@@ -110,6 +116,25 @@ final class SqliteStatementCacheTest extends TestCase
         } finally {
             $connection->close();
         }
+    }
+
+    public function testNativePreparationCountSurvivesCommitAndRollback(): void
+    {
+        $worker = $this->createWorker(statementCacheSize: 2);
+        $request = ['operation' => 'execute', 'sql' => 'SELECT ? AS value', 'params' => [1], 'bind_parameters' => true];
+        $worker->handle($request);
+        self::assertSame(1, $worker->getUserStatementPreparations());
+
+        foreach (['commit', 'rollback'] as $action) {
+            $worker->handle(['operation' => 'executeControl', 'action' => 'begin', 'transaction_mode' => 'DEFERRED']);
+            $before = $worker->getUserStatementPreparations();
+            self::assertSame([['value' => 1]], $worker->handle($request)['rows']);
+            self::assertSame($before, $worker->getUserStatementPreparations());
+            $worker->handle(['operation' => 'executeControl', 'action' => $action]);
+            self::assertSame([['value' => 1]], $worker->handle($request)['rows']);
+            self::assertSame($before, $worker->getUserStatementPreparations());
+        }
+        $worker->handle(['operation' => 'close']);
     }
 
     public function testOmittedParametersBecomeNullAndLargeBlobsDoNotLeak(): void

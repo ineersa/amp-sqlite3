@@ -696,15 +696,18 @@ final class WorkerProcess
                 $statement = $this->statements[$statementId];
                 $this->resetStatement($statement);
                 $this->assertExecutable($statement);
+                $bindParameters = self::optionalBool($request, 'bind_parameters', true);
+                $parameters = self::requireParameters($request);
             } else {
                 $sql = self::requireSql($request);
-                self::requireParameters($request);
-                self::optionalBool($request, 'bind_parameters', true);
+                $parameters = self::requireParameters($request);
+                $bindParameters = self::optionalBool($request, 'bind_parameters', true);
                 $statement = $this->statementCache->borrow($sql);
                 if ($statement !== null) {
                     $owned = true;
                     $cacheKey = $sql;
-                    $this->resetStatement($statement);
+                    // Idle handles have already been reset and had their bindings cleared on release.
+                    $this->assertExecutable($statement);
                 } else {
                     $statement = $this->prepareSingleStatement($sql, 'Only one SQL statement may be executed at a time');
                     $owned = true;
@@ -712,15 +715,15 @@ final class WorkerProcess
                         $cacheKey = $sql;
                     }
                 }
-                $this->assertExecutable($statement);
             }
 
-            $this->bindParameters($statement, $request);
+            $this->bindParameters($statement, $parameters, $bindParameters);
 
             try {
                 $nativeResult = $this->executeStatement($statement);
             } finally {
-                if ($this->flushesImplicitStatements($sql ?? $statement->getSQL())) {
+                // Cache admission excludes every configuration/schema boundary we must classify here.
+                if ($cacheKey === null && $this->flushesImplicitStatements($sql ?? $statement->getSQL())) {
                     $this->flushImplicitStatements();
                 }
             }
@@ -796,16 +799,15 @@ final class WorkerProcess
     }
 
     /**
-     * @param array<string, mixed> $request
+     * @param array<array-key, SqliteParameterValue> $parameters
      */
-    private function bindParameters(\SQLite3Stmt $statement, array $request): void
+    private function bindParameters(\SQLite3Stmt $statement, array $parameters, bool $bindParameters): void
     {
-        $bindParameters = self::optionalBool($request, 'bind_parameters', true);
         if ($bindParameters === false && $statement->paramCount() > 0) {
             throw new \RuntimeException('Parameters are not allowed in direct queries');
         }
 
-        foreach (self::requireParameters($request) as $key => $value) {
+        foreach ($parameters as $key => $value) {
             $position = \is_int($key) ? $key + 1 : $key;
             $type = match (true) {
                 $value === null => SQLITE3_NULL,
@@ -1195,10 +1197,7 @@ final class WorkerProcess
     }
 
     /**
-     * Reads PRAGMA count_changes with a single-shot querySingle.
-     *
-     * A cached prepare/execute/fetch path is retained for schema_version, where SQLite keeps a reusable
-     * program. count_changes is marked for one execution, so the cached path recompiles on every read.
+     * Reads the live count_changes flag. Retain the cached helper while the single-shot strategy is under review.
      */
     private function countChangesEnabled(): bool
     {
