@@ -154,7 +154,7 @@ final class Transaction implements SqliteTransaction
             $this->awaitDroppedNestedTransaction();
 
             $savepoint = 'amp_sqlite_' . $this->nextSavepointId++;
-            $this->connection->executeControl("SAVEPOINT {$savepoint}");
+            $this->connection->executeControl(SqliteTransactionControlAction::Savepoint, savepoint: $savepoint);
             $this->nestedBusy = new DeferredFuture();
             $transaction = new self($this->connection, $this->mode, $this, $savepoint);
             $this->activeNested = \WeakReference::create($transaction);
@@ -189,7 +189,11 @@ final class Transaction implements SqliteTransaction
             $this->assertNoActiveNestedTransaction();
             $this->awaitDroppedNestedTransaction();
             $this->assertActive();
-            $this->connection->executeControl($this->savepoint === null ? 'COMMIT' : "RELEASE SAVEPOINT {$this->savepoint}");
+            if ($this->savepoint === null) {
+                $this->connection->executeControl(SqliteTransactionControlAction::Commit);
+            } else {
+                $this->connection->executeControl(SqliteTransactionControlAction::ReleaseSavepoint, savepoint: $this->savepoint);
+            }
             $this->active = false;
             self::closeStatements($this->statements);
             $this->parent?->releaseNested($this);
@@ -321,10 +325,10 @@ final class Transaction implements SqliteTransaction
     private static function executeRollback(Connection $connection, ?string $savepoint): void
     {
         if ($savepoint === null) {
-            $connection->executeControl('ROLLBACK');
+            $connection->executeControl(SqliteTransactionControlAction::Rollback);
         } else {
-            $connection->executeControl("ROLLBACK TO SAVEPOINT {$savepoint}");
-            $connection->executeControl("RELEASE SAVEPOINT {$savepoint}");
+            $connection->executeControl(SqliteTransactionControlAction::RollbackToSavepoint, savepoint: $savepoint);
+            $connection->executeControl(SqliteTransactionControlAction::ReleaseSavepoint, savepoint: $savepoint);
         }
     }
 

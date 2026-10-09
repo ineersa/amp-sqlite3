@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Send transaction control as a typed worker request instead of the generic execute path
+
 ## 1.1.0
 
 - Count only rows changed directly by INSERT, UPDATE, and DELETE statements, so trigger writes, virtual table internals, and CREATE TABLE AS SELECT no longer count
