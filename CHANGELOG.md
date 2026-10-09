@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Skip remote cursor-close requests when the worker has already exhausted the result
+
 ## 1.1.0
 
 - Count only rows changed directly by INSERT, UPDATE, and DELETE statements, so trigger writes, virtual table internals, and CREATE TABLE AS SELECT no longer count
