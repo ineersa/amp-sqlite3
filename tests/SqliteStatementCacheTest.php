@@ -172,7 +172,7 @@ final class SqliteStatementCacheTest extends TestCase
         $worker->handle(['operation' => 'close']);
     }
 
-    public function testBindingFailureDiscardsBorrowedHandleWithoutReplay(): void
+    public function testInvalidParameterShapeLeavesIdleHandleAvailable(): void
     {
         $worker = $this->createWorker(statementCacheSize: 8);
         $sql = 'SELECT ? AS value';
@@ -189,8 +189,27 @@ final class SqliteStatementCacheTest extends TestCase
 
         $result = $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [2], 'bind_parameters' => true]);
         self::assertSame([['value' => 2]], $result['rows']);
-        self::assertSame(2, $worker->getUserStatementPreparations());
+        self::assertSame(1, $worker->getUserStatementPreparations());
 
+        $worker->handle(['operation' => 'close']);
+    }
+
+    public function testBindingFailureDiscardsBorrowedHandleWithoutReplay(): void
+    {
+        $worker = $this->createWorker(statementCacheSize: 8);
+        $sql = 'SELECT ? AS value';
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [1], 'bind_parameters' => true]);
+
+        try {
+            $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [':missing' => 2], 'bind_parameters' => true]);
+            self::fail('Expected binding failure');
+        } catch (\RuntimeException $exception) {
+            self::assertSame("Invalid parameter ':missing'", $exception->getMessage());
+        }
+
+        $result = $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [3], 'bind_parameters' => true]);
+        self::assertSame([['value' => 3]], $result['rows']);
+        self::assertSame(2, $worker->getUserStatementPreparations());
         $worker->handle(['operation' => 'close']);
     }
 
@@ -213,6 +232,132 @@ final class SqliteStatementCacheTest extends TestCase
         self::assertSame(3, $worker->getUserStatementPreparations());
 
         $worker->handle(['operation' => 'close']);
+    }
+
+    public function testPreparedPragmaFlushesIdleCacheDuringPrepareAndAgainOnExecute(): void
+    {
+        $worker = $this->createWorker(statementCacheSize: 8);
+        $sql = 'SELECT ? AS value';
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [1], 'bind_parameters' => true]);
+        self::assertSame(1, $worker->getUserStatementPreparations());
+
+        // Preparing a PRAGMA setter can change compile configuration before execute.
+        $prepared = $worker->handle(['operation' => 'prepare', 'sql' => 'PRAGMA count_changes = ON']);
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [2], 'bind_parameters' => true]);
+        self::assertSame(3, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [3], 'bind_parameters' => true]);
+        self::assertSame(3, $worker->getUserStatementPreparations());
+
+        $worker->handle([
+            'operation' => 'executeStatement',
+            'statement_id' => $prepared['statement_id'],
+            'params' => [],
+            'bind_parameters' => true,
+        ]);
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [4], 'bind_parameters' => true]);
+        self::assertSame(4, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'closeStatement', 'statement_id' => $prepared['statement_id']]);
+        $worker->handle(['operation' => 'close']);
+    }
+
+    public function testRejectedBoundaryPrepareStillFlushesIdleCache(): void
+    {
+        $worker = $this->createWorker(statementCacheSize: 8);
+        $sql = 'SELECT ? AS value';
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [1], 'bind_parameters' => true]);
+        self::assertSame(1, $worker->getUserStatementPreparations());
+
+        try {
+            $worker->handle(['operation' => 'prepare', 'sql' => 'PRAGMA count_changes = ON; SELECT 1']);
+            self::fail('Expected multi-statement prepare rejection');
+        } catch (\Throwable $exception) {
+            self::assertStringContainsString('Only one SQL statement may be prepared at a time', $exception->getMessage());
+        }
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [2], 'bind_parameters' => true]);
+        self::assertSame(3, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'close']);
+    }
+
+    public function testLaterFetchFailureDiscardsBorrowedHandle(): void
+    {
+        $worker = $this->createWorker(
+            statementCacheSize: 8,
+            batchSize: 1,
+            functions: [
+                'fail_after_first' => [
+                    'callback' => self::class.'::failAfterFirstRow',
+                    'arg_count' => 1,
+                    'deterministic' => true,
+                ],
+            ],
+        );
+        $sql = 'SELECT fail_after_first(value) AS value FROM (SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3)';
+
+        $open = $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [], 'bind_parameters' => true]);
+        self::assertFalse($open['exhausted']);
+        self::assertSame([['value' => 1]], $open['rows']);
+        self::assertSame(1, $worker->getUserStatementPreparations());
+
+        try {
+            $worker->handle(['operation' => 'fetch', 'result_id' => $open['result_id']]);
+            self::fail('Expected later fetch failure');
+        } catch (\Throwable $exception) {
+            self::assertSame('forced later fetch failure', $exception->getPrevious()?->getMessage() ?? $exception->getMessage());
+        }
+
+        // Discard-on-error must not return the failing handle to the idle cache.
+        $worker->handle(['operation' => 'execute', 'sql' => 'SELECT 1 AS value', 'params' => [], 'bind_parameters' => true]);
+        $retry = $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [], 'bind_parameters' => true]);
+        self::assertFalse($retry['exhausted']);
+        // fail SQL (1) + SELECT 1 (2) + fail SQL again (3) proves the discarded handle was not reused.
+        self::assertSame(3, $worker->getUserStatementPreparations());
+        $worker->handle(['operation' => 'closeResult', 'result_id' => $retry['result_id']]);
+
+        $worker->handle(['operation' => 'close']);
+    }
+
+    public function testFirstFetchFailureDiscardsBorrowedHandle(): void
+    {
+        $worker = $this->createWorker(
+            statementCacheSize: 8,
+            batchSize: 1,
+            functions: [
+                'fail_after_first' => [
+                    'callback' => self::class.'::failAfterFirstRow',
+                    'arg_count' => 1,
+                    'deterministic' => true,
+                ],
+            ],
+        );
+        $sql = 'SELECT fail_after_first(value) AS value FROM (SELECT 1 AS value UNION ALL SELECT 3)';
+
+        for ($attempt = 1; $attempt <= 2; ++$attempt) {
+            try {
+                $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [], 'bind_parameters' => true]);
+                self::fail('Expected first fetch failure');
+            } catch (\SQLite3Exception $exception) {
+                self::assertSame('forced later fetch failure', $exception->getPrevious()?->getMessage());
+            }
+            self::assertSame($attempt, $worker->getUserStatementPreparations());
+        }
+
+        $worker->handle(['operation' => 'close']);
+    }
+
+    public static function failAfterFirstRow(int $value): int
+    {
+        if ($value > 2) {
+            throw new \RuntimeException('forced later fetch failure');
+        }
+
+        return $value;
     }
 
     public function testPublicPreparedStatementsRemainSeparate(): void
@@ -247,7 +392,10 @@ final class SqliteStatementCacheTest extends TestCase
         );
     }
 
-    private function createWorker(int $statementCacheSize, int $batchSize = 100): WorkerProcess
+    /**
+     * @param array<string, array{callback: string, arg_count: int, deterministic: bool}> $functions
+     */
+    private function createWorker(int $statementCacheSize, int $batchSize = 100, array $functions = []): WorkerProcess
     {
         $worker = new WorkerProcess([
             'path' => ':memory:',
@@ -261,7 +409,7 @@ final class SqliteStatementCacheTest extends TestCase
             'trusted_schema' => false,
             'extended_result_codes' => true,
             'pragmas' => [],
-            'functions' => [],
+            'functions' => $functions,
             'aggregates' => [],
             'collations' => [],
         ]);

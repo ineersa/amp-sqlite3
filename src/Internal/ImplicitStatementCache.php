@@ -29,6 +29,9 @@ final class ImplicitStatementCache
     public function __construct(
         private readonly int $capacity,
     ) {
+        if ($capacity < 0) {
+            throw new \InvalidArgumentException('Statement cache size must not be negative');
+        }
     }
 
     public function borrow(string $sql): ?\SQLite3Stmt

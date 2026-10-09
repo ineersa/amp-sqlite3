@@ -551,7 +551,17 @@ final class WorkerProcess
             throw new ProtocolError("Unknown result ID '{$resultId}'");
         }
 
-        $batch = $this->fetchBatch($resultId);
+        try {
+            $batch = $this->fetchBatch($resultId);
+        } catch (\Throwable $exception) {
+            try {
+                $this->closeNativeResult($this->results[$resultId], returnToCache: false);
+            } catch (\Throwable) {
+            }
+            unset($this->results[$resultId]);
+
+            throw $exception;
+        }
         if ($batch['exhausted']) {
             $this->closeNativeResult($this->results[$resultId]);
             unset($this->results[$resultId]);
@@ -643,6 +653,8 @@ final class WorkerProcess
                 $this->assertExecutable($statement);
             } else {
                 $sql = self::requireSql($request);
+                self::requireParameters($request);
+                self::optionalBool($request, 'bind_parameters', true);
                 $statement = $this->statementCache->borrow($sql);
                 if ($statement !== null) {
                     $owned = true;
@@ -660,12 +672,15 @@ final class WorkerProcess
 
             $this->bindParameters($statement, $request);
 
-            $nativeResult = $this->executeStatement($statement);
+            try {
+                $nativeResult = $this->executeStatement($statement);
+            } finally {
+                if ($this->flushesImplicitStatements($sql ?? $statement->getSQL())) {
+                    $this->flushImplicitStatements();
+                }
+            }
             if ($this->statementInfo[$statement]['metadata']['attach'] ?? false) {
                 $this->ordinaryRowIdTables = [];
-                $this->flushImplicitStatements();
-            }
-            if ($sql !== null && $this->flushesImplicitStatements($sql)) {
                 $this->flushImplicitStatements();
             }
             $columns = $nativeResult->numColumns();
@@ -710,7 +725,7 @@ final class WorkerProcess
                 $batch = $this->fetchBatch($resultId);
             } catch (\Throwable $exception) {
                 try {
-                    $this->closeNativeResult($this->results[$resultId]);
+                    $this->closeNativeResult($this->results[$resultId], returnToCache: false);
                 } catch (\Throwable) {
                 }
                 unset($this->results[$resultId]);
@@ -817,17 +832,22 @@ final class WorkerProcess
     /**
      * @param array{result: \SQLite3Result, statement: \SQLite3Stmt, statement_id: int|null, cache_key: string|null, pending: SqliteRow|null} $resource
      */
-    private function closeNativeResult(array $resource): void
+    private function closeNativeResult(array $resource, bool $returnToCache = true): void
     {
-        $resource['result']->finalize();
-        if ($resource['statement_id'] !== null) {
-            return;
-        }
-
-        if (\array_key_exists('cache_key', $resource) && $resource['cache_key'] !== null) {
-            $this->releaseImplicitStatement($resource['statement'], $resource['cache_key']);
-        } else {
-            $resource['statement']->close();
+        $finalized = false;
+        try {
+            $resource['result']->finalize();
+            $finalized = true;
+        } finally {
+            if ($resource['statement_id'] === null) {
+                if (!$finalized || !$returnToCache) {
+                    $this->discardImplicitStatement($resource['statement']);
+                } elseif ($resource['cache_key'] !== null) {
+                    $this->releaseImplicitStatement($resource['statement'], $resource['cache_key']);
+                } else {
+                    $resource['statement']->close();
+                }
+            }
         }
     }
 
@@ -900,41 +920,48 @@ final class WorkerProcess
 
     private function prepareSingleStatement(string $sql, string $error): \SQLite3Stmt
     {
-        if ($this->countUserStatementPreparations) {
-            ++$this->userStatementPreparations;
-        }
-        [$statement, $metadata] = $this->captureMetadata(fn (): \SQLite3Stmt|false => $this->database->prepare($sql));
-        if (!$statement) {
-            throw new \RuntimeException('SQL must contain an executable statement');
-        }
         try {
-            $consumedSql = $statement->getSQL();
-            // @phpstan-ignore catch.neverThrown (getSQL() throws when the SQL only contains comments)
-        } catch (\Error $previous) {
-            throw new \RuntimeException('SQL must contain an executable statement', previous: $previous);
-        }
-        if (SqlStatementBoundary::hasSecondStatement(\substr($sql, \strlen($consumedSql)))) {
-            $statement->close();
-            throw new \RuntimeException($error);
-        }
-
-        $metadata ??= self::emptyMetadata();
-        $writes = !$statement->readOnly()
-            && !SqlStatementBoundary::startsWithKeyword($consumedSql, 'EXPLAIN')
-            && ($metadata['insert'] !== null || $metadata['update'] || $metadata['delete']);
-
-        try {
-            if ($writes && $this->producesRows($consumedSql)) {
-                throw new \RuntimeException('Row-producing DML statements are not supported by the PHP SQLite3 extension');
+            if ($this->countUserStatementPreparations) {
+                ++$this->userStatementPreparations;
             }
-        } catch (\Throwable $exception) {
-            $statement->close();
-            throw $exception;
+            [$statement, $metadata] = $this->captureMetadata(fn (): \SQLite3Stmt|false => $this->database->prepare($sql));
+            if (!$statement) {
+                throw new \RuntimeException('SQL must contain an executable statement');
+            }
+            try {
+                $consumedSql = $statement->getSQL();
+                // @phpstan-ignore catch.neverThrown (getSQL() throws when the SQL only contains comments)
+            } catch (\Error $previous) {
+                throw new \RuntimeException('SQL must contain an executable statement', previous: $previous);
+            }
+            if (SqlStatementBoundary::hasSecondStatement(\substr($sql, \strlen($consumedSql)))) {
+                $statement->close();
+                throw new \RuntimeException($error);
+            }
+
+            $metadata ??= self::emptyMetadata();
+            $writes = !$statement->readOnly()
+                && !SqlStatementBoundary::startsWithKeyword($consumedSql, 'EXPLAIN')
+                && ($metadata['insert'] !== null || $metadata['update'] || $metadata['delete']);
+
+            try {
+                if ($writes && $this->producesRows($consumedSql)) {
+                    throw new \RuntimeException('Row-producing DML statements are not supported by the PHP SQLite3 extension');
+                }
+            } catch (\Throwable $exception) {
+                $statement->close();
+                throw $exception;
+            }
+
+            $this->statementInfo[$statement] = ['metadata' => $metadata, 'writes' => $writes, 'stale' => false];
+
+            return $statement;
+        } finally {
+            // PRAGMA setters and schema/config SQL can take effect during prepare, including failed attempts.
+            if ($this->flushesImplicitStatements($sql)) {
+                $this->flushImplicitStatements();
+            }
         }
-
-        $this->statementInfo[$statement] = ['metadata' => $metadata, 'writes' => $writes, 'stale' => false];
-
-        return $statement;
     }
 
     /**
