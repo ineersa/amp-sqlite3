@@ -1203,7 +1203,7 @@ final class WorkerProcess
     private function countChangesEnabled(): bool
     {
         // Unknown PRAGMA names return null/false. Hard SQL failures still throw SQLite3Exception.
-        return (bool) $this->database->querySingle('PRAGMA count_changes');
+        return (bool) $this->queryInternal('PRAGMA count_changes');
     }
 
     private function detectLastInsertId(\SQLite3Stmt $statement, int $before): ?int
