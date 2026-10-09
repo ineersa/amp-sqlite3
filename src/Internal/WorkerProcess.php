@@ -804,7 +804,7 @@ final class WorkerProcess
      */
     private function assertExecutable(\SQLite3Stmt $statement): void
     {
-        if (($this->statementInfo[$statement]['writes'] ?? false) && $this->queryInternal('PRAGMA count_changes')) {
+        if (($this->statementInfo[$statement]['writes'] ?? false) && $this->countChangesEnabled()) {
             throw new \RuntimeException('Row-producing DML statements are not supported by the PHP SQLite3 extension');
         }
     }
@@ -917,7 +917,7 @@ final class WorkerProcess
     private function producesRows(string $sql): bool
     {
         // Without count_changes, only the SQL text (a RETURNING clause) decides whether DML produces rows
-        if (\strlen($sql) > self::ROW_PRODUCING_DML_CACHE_MAX_SQL_LENGTH || $this->queryInternal('PRAGMA count_changes')) {
+        if (\strlen($sql) > self::ROW_PRODUCING_DML_CACHE_MAX_SQL_LENGTH || $this->countChangesEnabled()) {
             return $this->explainProducesRows($sql);
         }
 
@@ -980,6 +980,18 @@ final class WorkerProcess
         }
 
         return $row === false ? null : $row[0];
+    }
+
+    /**
+     * Reads PRAGMA count_changes with a single-shot querySingle.
+     *
+     * A cached prepare/execute/fetch path is retained for schema_version, where SQLite keeps a reusable
+     * program. count_changes is marked for one execution, so the cached path recompiles on every read.
+     */
+    private function countChangesEnabled(): bool
+    {
+        // Unknown PRAGMA names return null/false. Hard SQL failures still throw SQLite3Exception.
+        return (bool) $this->database->querySingle('PRAGMA count_changes');
     }
 
     private function detectLastInsertId(\SQLite3Stmt $statement, int $before): ?int
