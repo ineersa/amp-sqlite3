@@ -34,6 +34,7 @@ return static function (Channel $channel): null {
             'execute',
             'executeStatement',
             'executeScript',
+            'executeControl',
         ], true);
 
         try {

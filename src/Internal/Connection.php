@@ -108,7 +108,7 @@ final class Connection implements SqliteCancellableConnection
         $lock = $this->acquireConnectionLock();
 
         try {
-            $this->executeControl('BEGIN ' . $this->transactionMode->toSql());
+            $this->executeControl(SqliteTransactionControlAction::Begin, $this->transactionMode);
         } catch (\Throwable $exception) {
             $lock->release();
             throw $exception;
@@ -273,14 +273,46 @@ final class Connection implements SqliteCancellableConnection
         return $this->createResult($value, $sql, $lock, $transactional);
     }
 
-    public function executeControl(string $sql): void
-    {
+    public function executeControl(
+        SqliteTransactionControlAction $action,
+        ?SqliteTransactionMode $mode = null,
+        ?string $savepoint = null,
+    ): void {
         $this->assertCurrentTaskHoldsNoTransactionLease();
         $this->leases->awaitTransactionIdle();
-        $value = $this->requestResultPayload('execute', $sql, ['sql' => $sql, 'params' => []]);
-        if ($value['result_id'] !== null) {
-            $this->closeResult($value['result_id'], $sql);
+        $sql = self::controlSql($action, $mode, $savepoint);
+        $payload = ['action' => $action->value];
+        if ($mode !== null) {
+            $payload['transaction_mode'] = $mode->toSql();
         }
+        if ($savepoint !== null) {
+            if (!self::isGeneratedSavepoint($savepoint)) {
+                throw new \InvalidArgumentException("Invalid savepoint identifier '{$savepoint}'");
+            }
+            $payload['savepoint'] = $savepoint;
+        }
+
+        $this->requestVoid('executeControl', $sql, $payload);
+    }
+
+    public static function isGeneratedSavepoint(string $savepoint): bool
+    {
+        return 1 === \preg_match('/\Aamp_sqlite_[1-9]\d*\z/', $savepoint);
+    }
+
+    private static function controlSql(
+        SqliteTransactionControlAction $action,
+        ?SqliteTransactionMode $mode,
+        ?string $savepoint,
+    ): string {
+        return match ($action) {
+            SqliteTransactionControlAction::Begin => 'BEGIN ' . ($mode ?? throw new \InvalidArgumentException('BEGIN requires a transaction mode'))->toSql(),
+            SqliteTransactionControlAction::Commit => 'COMMIT',
+            SqliteTransactionControlAction::Rollback => 'ROLLBACK',
+            SqliteTransactionControlAction::Savepoint => 'SAVEPOINT ' . ($savepoint ?? throw new \InvalidArgumentException('SAVEPOINT requires an identifier')),
+            SqliteTransactionControlAction::ReleaseSavepoint => 'RELEASE SAVEPOINT ' . ($savepoint ?? throw new \InvalidArgumentException('RELEASE SAVEPOINT requires an identifier')),
+            SqliteTransactionControlAction::RollbackToSavepoint => 'ROLLBACK TO SAVEPOINT ' . ($savepoint ?? throw new \InvalidArgumentException('ROLLBACK TO SAVEPOINT requires an identifier')),
+        };
     }
 
     /**

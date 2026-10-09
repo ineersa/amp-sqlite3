@@ -180,6 +180,7 @@ final class WorkerProcess
                 self::requireSql($request),
                 self::requireTransactionMode($request),
             ),
+            'executeControl' => $this->executeControl($request),
             default => throw new ProtocolError("Unknown operation '{$operation}'"),
         };
     }
@@ -628,6 +629,50 @@ final class WorkerProcess
         }
 
         return null;
+    }
+
+    /**
+     * @param array<string, mixed> $request
+     */
+    private function executeControl(array $request): null
+    {
+        $this->database->exec(self::controlSql($request));
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $request
+     */
+    private static function controlSql(array $request): string
+    {
+        $action = self::requireString($request, 'action');
+        $control = SqliteTransactionControlAction::tryFrom($action);
+        if ($control === null) {
+            throw new ProtocolError("Invalid transaction control action '{$action}'");
+        }
+
+        return match ($control) {
+            SqliteTransactionControlAction::Begin => 'BEGIN ' . self::requireTransactionMode($request),
+            SqliteTransactionControlAction::Commit => 'COMMIT',
+            SqliteTransactionControlAction::Rollback => 'ROLLBACK',
+            SqliteTransactionControlAction::Savepoint => 'SAVEPOINT ' . self::requireGeneratedSavepoint($request),
+            SqliteTransactionControlAction::ReleaseSavepoint => 'RELEASE SAVEPOINT ' . self::requireGeneratedSavepoint($request),
+            SqliteTransactionControlAction::RollbackToSavepoint => 'ROLLBACK TO SAVEPOINT ' . self::requireGeneratedSavepoint($request),
+        };
+    }
+
+    /**
+     * @param array<string, mixed> $request
+     */
+    private static function requireGeneratedSavepoint(array $request): string
+    {
+        $savepoint = self::requireString($request, 'savepoint');
+        if (!Connection::isGeneratedSavepoint($savepoint)) {
+            throw new ProtocolError("Invalid savepoint identifier '{$savepoint}'");
+        }
+
+        return $savepoint;
     }
 
     /**

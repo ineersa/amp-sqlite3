@@ -545,7 +545,8 @@ final class SqliteTransactionTest extends TestCase
         try {
             $transaction->commit();
             self::fail('Expected the deferred foreign key check to fail');
-        } catch (\Fabpot\Amp\Sqlite\SqliteQueryError) {
+        } catch (\Fabpot\Amp\Sqlite\SqliteQueryError $error) {
+            self::assertSame('COMMIT', $error->getQuery());
         }
 
         self::assertTrue($transaction->isActive());

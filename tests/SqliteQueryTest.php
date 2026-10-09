@@ -273,6 +273,65 @@ final class SqliteQueryTest extends TestCase
         }
     }
 
+    #[DataProvider('provideInvalidTransactionControlRequests')]
+    public function testWorkerRejectsMalformedTransactionControl(array $request, string $message): void
+    {
+        $worker = $this->createWorker(batchSize: 1);
+
+        try {
+            $this->expectException(ProtocolError::class);
+            $this->expectExceptionMessage($message);
+
+            $worker->handle(['operation' => 'executeControl', ...$request]);
+        } finally {
+            $worker->shutdown();
+        }
+    }
+
+    public static function provideInvalidTransactionControlRequests(): iterable
+    {
+        yield 'unknown action' => [['action' => 'vacuum'], "Invalid transaction control action 'vacuum'"];
+        yield 'begin without mode' => [['action' => 'begin'], "Protocol field 'transaction_mode' must be a string"];
+        yield 'invalid mode' => [['action' => 'begin', 'transaction_mode' => 'READ UNCOMMITTED'], "Invalid transaction mode 'READ UNCOMMITTED'"];
+        yield 'savepoint without identifier' => [['action' => 'savepoint'], "Protocol field 'savepoint' must be a string"];
+        yield 'arbitrary savepoint' => [['action' => 'savepoint', 'savepoint' => 'user_sp'], "Invalid savepoint identifier 'user_sp'"];
+        yield 'zero savepoint' => [['action' => 'release-savepoint', 'savepoint' => 'amp_sqlite_0'], "Invalid savepoint identifier 'amp_sqlite_0'"];
+    }
+
+    public function testWorkerTransactionControlReturnsVoid(): void
+    {
+        $worker = $this->createWorker(batchSize: 1);
+
+        try {
+            self::assertNull($worker->handle([
+                'operation' => 'executeControl',
+                'action' => 'begin',
+                'transaction_mode' => 'DEFERRED',
+            ]));
+            self::assertNull($worker->handle([
+                'operation' => 'executeControl',
+                'action' => 'savepoint',
+                'savepoint' => 'amp_sqlite_1',
+            ]));
+            self::assertNull($worker->handle([
+                'operation' => 'executeControl',
+                'action' => 'rollback-to-savepoint',
+                'savepoint' => 'amp_sqlite_1',
+            ]));
+            self::assertNull($worker->handle([
+                'operation' => 'executeControl',
+                'action' => 'release-savepoint',
+                'savepoint' => 'amp_sqlite_1',
+            ]));
+            self::assertNull($worker->handle([
+                'operation' => 'executeControl',
+                'action' => 'commit',
+            ]));
+        } finally {
+            $worker->shutdown();
+        }
+    }
+
     public function testWorkerRejectsBlobNamesWithNulBytes(): void
     {
         $worker = $this->createWorker(batchSize: 1);
