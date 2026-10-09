@@ -194,30 +194,60 @@ final class Transaction implements SqliteTransaction
             } else {
                 $this->connection->executeControl(SqliteTransactionControlAction::ReleaseSavepoint, savepoint: $this->savepoint);
             }
-            $this->active = false;
-            self::closeStatements($this->statements);
-            $this->parent?->releaseNested($this);
-            if ($this->parent === null) {
-                $this->onCommit->complete();
-                $this->connection->releaseTransaction($this);
-            } else {
-                $onCommit = $this->onCommit;
-                $this->parent->onCommit(static function () use ($onCommit): void {
-                    if (!$onCommit->isComplete()) {
-                        $onCommit->complete();
-                    }
-                });
-                $onRollback = $this->onRollback;
-                $this->parent->onRollback(static function () use ($onRollback): void {
-                    if (!$onRollback->isComplete()) {
-                        $onRollback->complete();
-                    }
-                });
-            }
-            $this->onClose->complete();
+            $this->finishCommit();
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * Experimental root-only insert operation; BEGIN and the caller clock remain separate.
+     *
+     * @param array<array-key, null|bool|int|float|string|SqliteBlob> $params
+     */
+    public function executeInsertAndCommit(string $sql, #[\SensitiveParameter] array $params): int
+    {
+        if ($this->parent !== null) {
+            throw new SqliteTransactionError('Combined insert and commit requires a root transaction');
+        }
+        $this->assertCurrentTaskHoldsNoLease();
+        $lock = $this->stateMutex->acquire();
+        try {
+            $this->assertNoActiveNestedTransaction();
+            $this->awaitDroppedNestedTransaction();
+            $this->assertActive();
+            $id = $this->connection->executeInsertAndCommit($sql, $params);
+            $this->finishCommit();
+
+            return $id;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function finishCommit(): void
+    {
+        $this->active = false;
+        self::closeStatements($this->statements);
+        $this->parent?->releaseNested($this);
+        if ($this->parent === null) {
+            $this->onCommit->complete();
+            $this->connection->releaseTransaction($this);
+        } else {
+            $onCommit = $this->onCommit;
+            $this->parent->onCommit(static function () use ($onCommit): void {
+                if (!$onCommit->isComplete()) {
+                    $onCommit->complete();
+                }
+            });
+            $onRollback = $this->onRollback;
+            $this->parent->onRollback(static function () use ($onRollback): void {
+                if (!$onRollback->isComplete()) {
+                    $onRollback->complete();
+                }
+            });
+        }
+        $this->onClose->complete();
     }
 
     public function rollback(): void

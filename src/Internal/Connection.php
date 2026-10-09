@@ -273,6 +273,29 @@ final class Connection implements SqliteCancellableConnection
         return $this->createResult($value, $sql, $lock, $transactional);
     }
 
+    /**
+     * @param array<array-key, SqliteParameterValue> $params
+     */
+    public function executeInsertAndCommit(string $sql, #[\SensitiveParameter] array $params): int
+    {
+        $this->assertOpen();
+        self::validateParameterValues($params);
+        $this->assertCurrentTaskHoldsNoTransactionLease();
+        $this->leases->awaitTransactionIdle();
+
+        try {
+            // WorkerChannel applies WorkerResponse::unwrap to the envelope and request ID.
+            $id = $this->channel->request('executeInsertAndCommit', $sql, ['sql' => $sql, 'params' => $params]);
+            if (!\is_int($id) || $id < 1) {
+                throw new WorkerFailure('Combined insert reply must contain a positive native insert ID');
+            }
+
+            return $id;
+        } catch (WorkerFailure $failure) {
+            $this->fail($failure);
+        }
+    }
+
     public function executeControl(
         SqliteTransactionControlAction $action,
         ?SqliteTransactionMode $mode = null,

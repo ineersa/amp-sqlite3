@@ -181,6 +181,7 @@ final class WorkerProcess
                 self::requireTransactionMode($request),
             ),
             'executeControl' => $this->executeControl($request),
+            'executeInsertAndCommit' => $this->executeInsertAndCommit($request),
             default => throw new ProtocolError("Unknown operation '{$operation}'"),
         };
     }
@@ -629,6 +630,25 @@ final class WorkerProcess
         }
 
         return null;
+    }
+
+    /**
+     * @param array<string, mixed> $request
+     */
+    private function executeInsertAndCommit(array $request): int
+    {
+        $value = $this->execute($request);
+        // A non-insert must not retain a live cursor or commit this transaction.
+        if (\is_int($value['result_id']) && !$value['exhausted']) {
+            $this->closeResult($value['result_id']);
+        }
+        $id = $value['last_insert_id'];
+        if (!\is_int($id) || $id <= 0) {
+            throw new \SQLite3Exception('Insert must produce a positive native insert ID before COMMIT');
+        }
+        $this->database->exec('COMMIT');
+
+        return $id;
     }
 
     /**
