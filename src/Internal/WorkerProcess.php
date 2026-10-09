@@ -382,7 +382,7 @@ final class WorkerProcess
             \fclose($blob);
         }
         foreach ($this->results as $resource) {
-            $this->closeNativeResult($resource);
+            $this->closeNativeResult($resource, returnToCache: false);
         }
         foreach ($this->statements as $statement) {
             $statement->close();
@@ -907,6 +907,7 @@ final class WorkerProcess
         return SqlStatementBoundary::startsWithKeyword(
             $sql,
             'PRAGMA',
+            'EXPLAIN',
             'ATTACH',
             'DETACH',
             'ALTER',

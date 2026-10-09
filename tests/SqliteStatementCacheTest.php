@@ -264,6 +264,25 @@ final class SqliteStatementCacheTest extends TestCase
         $worker->handle(['operation' => 'close']);
     }
 
+    public function testPreparedExplainPragmaFlushesIdleCache(): void
+    {
+        $worker = $this->createWorker(statementCacheSize: 8);
+        $sql = 'SELECT ? AS value';
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [1], 'bind_parameters' => true]);
+        self::assertSame(1, $worker->getUserStatementPreparations());
+
+        $prepared = $worker->handle(['operation' => 'prepare', 'sql' => 'EXPLAIN PRAGMA count_changes = ON']);
+        $result = $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [2], 'bind_parameters' => true]);
+        self::assertSame([['value' => 2]], $result['rows']);
+        self::assertSame(3, $worker->getUserStatementPreparations());
+
+        $worker->handle(['operation' => 'execute', 'sql' => $sql, 'params' => [3], 'bind_parameters' => true]);
+        self::assertSame(3, $worker->getUserStatementPreparations());
+        $worker->handle(['operation' => 'closeStatement', 'statement_id' => $prepared['statement_id']]);
+        $worker->handle(['operation' => 'close']);
+    }
+
     public function testRejectedBoundaryPrepareStillFlushesIdleCache(): void
     {
         $worker = $this->createWorker(statementCacheSize: 8);
