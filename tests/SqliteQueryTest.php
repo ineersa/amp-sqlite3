@@ -727,6 +727,79 @@ final class SqliteQueryTest extends TestCase
         self::assertSame(0, $this->connection->query('SELECT COUNT(*) AS count FROM entries')->fetchRow()['count']);
     }
 
+    public function testCountChangesReadsToggleThroughDirectQueries(): void
+    {
+        self::assertSame(['count_changes' => 0], $this->connection->query('PRAGMA count_changes')->fetchRow());
+        $this->connection->query('PRAGMA count_changes = ON')->close();
+        self::assertSame(['count_changes' => 1], $this->connection->query('PRAGMA count_changes')->fetchRow());
+        $this->connection->query('PRAGMA count_changes = OFF')->close();
+        self::assertSame(['count_changes' => 0], $this->connection->query('PRAGMA count_changes')->fetchRow());
+    }
+
+    public function testPreparedCountChangesSetterTakesEffectBeforeExecution(): void
+    {
+        $this->connection->query('CREATE TABLE entries (value TEXT)');
+        $statement = $this->connection->prepare('INSERT INTO entries VALUES (?)');
+        $setter = $this->connection->prepare('PRAGMA count_changes = ON');
+
+        self::assertSame(['count_changes' => 1], $this->connection->query('PRAGMA count_changes')->fetchRow());
+
+        try {
+            $statement->execute(['duplicated']);
+            self::fail('Expected row-producing DML to be rejected');
+        } catch (SqliteQueryError $error) {
+            self::assertSame(
+                'Row-producing DML statements are not supported by the PHP SQLite3 extension',
+                $error->getMessage(),
+            );
+        }
+
+        self::assertSame(0, $this->connection->query('SELECT COUNT(*) AS count FROM entries')->fetchRow()['count']);
+        $setter->execute();
+        self::assertSame(['count_changes' => 1], $this->connection->query('PRAGMA count_changes')->fetchRow());
+    }
+
+    public function testExplainPragmaCountChangesSetterTakesEffectBeforeDmlExecution(): void
+    {
+        $this->connection->query('CREATE TABLE entries (value TEXT)');
+        $statement = $this->connection->prepare('INSERT INTO entries VALUES (?)');
+
+        // EXPLAIN still prepares the setter, so count_changes becomes effective before any DML runs.
+        self::assertNotNull($this->connection->query('EXPLAIN PRAGMA count_changes = ON')->fetchRow());
+        self::assertSame(['count_changes' => 1], $this->connection->query('PRAGMA count_changes')->fetchRow());
+
+        try {
+            $statement->execute(['duplicated']);
+            self::fail('Expected row-producing DML to be rejected');
+        } catch (SqliteQueryError $error) {
+            self::assertSame(
+                'Row-producing DML statements are not supported by the PHP SQLite3 extension',
+                $error->getMessage(),
+            );
+        }
+
+        self::assertSame(0, $this->connection->query('SELECT COUNT(*) AS count FROM entries')->fetchRow()['count']);
+    }
+
+    public function testSchemaQualifiedCountChangesToggleIsObservedByPreparedDmlGuard(): void
+    {
+        $this->connection->query('CREATE TABLE entries (value TEXT)');
+        $statement = $this->connection->prepare('INSERT INTO entries VALUES (?)');
+        $this->connection->query('PRAGMA main.count_changes = ON')->close();
+
+        try {
+            $statement->execute(['duplicated']);
+            self::fail('Expected row-producing DML to be rejected');
+        } catch (SqliteQueryError $error) {
+            self::assertSame(
+                'Row-producing DML statements are not supported by the PHP SQLite3 extension',
+                $error->getMessage(),
+            );
+        }
+
+        self::assertSame(0, $this->connection->query('SELECT COUNT(*) AS count FROM entries')->fetchRow()['count']);
+    }
+
     public function testTableDefinitionTextDoesNotHideUnambiguousInsertId(): void
     {
         $this->connection->executeScript(<<<'SQL'
