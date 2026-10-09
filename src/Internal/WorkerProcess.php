@@ -39,6 +39,7 @@ final class WorkerProcess
     private int $nextResultId = 1;
     private int $nextStatementId = 1;
     private int $userStatementPreparations = 0;
+    private bool $countUserStatementPreparations = false;
 
     /** @var array<int, resource> */
     private array $blobs = [];
@@ -196,9 +197,14 @@ final class WorkerProcess
     /**
      * Counts native preparations performed for public prepare() and direct execute/query misses.
      *
-     * Cache hits do not increment this counter. It is a worker-local diagnostic for tests, not a
-     * general telemetry channel.
+     * Disabled by default. Call enableUserStatementPreparationCounting() from tests or local
+     * diagnostics first. Cache hits never increment the counter.
      */
+    public function enableUserStatementPreparationCounting(): void
+    {
+        $this->countUserStatementPreparations = true;
+    }
+
     public function getUserStatementPreparations(): int
     {
         return $this->userStatementPreparations;
@@ -703,7 +709,10 @@ final class WorkerProcess
             try {
                 $batch = $this->fetchBatch($resultId);
             } catch (\Throwable $exception) {
-                $this->closeNativeResult($this->results[$resultId]);
+                try {
+                    $this->closeNativeResult($this->results[$resultId]);
+                } catch (\Throwable) {
+                }
                 unset($this->results[$resultId]);
 
                 throw $exception;
@@ -891,7 +900,9 @@ final class WorkerProcess
 
     private function prepareSingleStatement(string $sql, string $error): \SQLite3Stmt
     {
-        ++$this->userStatementPreparations;
+        if ($this->countUserStatementPreparations) {
+            ++$this->userStatementPreparations;
+        }
         [$statement, $metadata] = $this->captureMetadata(fn (): \SQLite3Stmt|false => $this->database->prepare($sql));
         if (!$statement) {
             throw new \RuntimeException('SQL must contain an executable statement');

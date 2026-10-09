@@ -249,7 +249,7 @@ final class SqliteStatementCacheTest extends TestCase
 
     private function createWorker(int $statementCacheSize, int $batchSize = 100): WorkerProcess
     {
-        return new WorkerProcess([
+        $worker = new WorkerProcess([
             'path' => ':memory:',
             'open_mode' => SqliteOpenMode::ReadWriteCreate->name,
             'journal_mode' => SqliteJournalMode::Automatic->value,
@@ -265,5 +265,8 @@ final class SqliteStatementCacheTest extends TestCase
             'aggregates' => [],
             'collations' => [],
         ]);
+        $worker->enableUserStatementPreparationCounting();
+
+        return $worker;
     }
 }
