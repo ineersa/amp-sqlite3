@@ -65,6 +65,7 @@ $config = (new SqliteConfig(__DIR__ . '/app.sqlite'))
     ->withBusyTimeout(5_000) // milliseconds
     ->withTrustedSchema(false)
     ->withBatchSize(100)
+    ->withStatementCacheSize(64)
     ->withTransactionMode(SqliteTransactionMode::Deferred)
     ->withExtendedResultCodes(true);
 ```
@@ -78,6 +79,7 @@ $config = (new SqliteConfig(__DIR__ . '/app.sqlite'))
 | Busy timeout | 5,000 ms | Increase when writes may wait longer for another writer. |
 | Trusted schema | Disabled | Enable only when trusted schema expressions must call application-defined functions. |
 | Batch size | 100 rows | Increase to reduce round trips for large results, or decrease to reduce buffered data. |
+| Statement cache size | 64 | Retains idle native statements for repeated direct query/execute SQL. Use `0` to disable. |
 | Transaction mode | `Deferred` | Use `Immediate` or `Exclusive` when a transaction should acquire a write lock when it begins. |
 | Extended result codes | Enabled | Disable only when base SQLite result codes are sufficient. |
 

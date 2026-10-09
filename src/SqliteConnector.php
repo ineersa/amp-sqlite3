@@ -70,6 +70,7 @@ final class SqliteConnector implements SqlConnector
                 'foreign_keys' => $config->hasForeignKeys(),
                 'busy_timeout' => $config->getBusyTimeout(),
                 'batch_size' => $config->getBatchSize(),
+                'statement_cache_size' => $config->getStatementCacheSize(),
                 'trusted_schema' => $config->hasTrustedSchema(),
                 'extended_result_codes' => $config->hasExtendedResultCodes(),
                 'pragmas' => $config->getPragmas(),

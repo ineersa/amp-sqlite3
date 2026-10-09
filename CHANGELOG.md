@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Reuse idle native statements for repeated direct query and execute calls through a bounded exact-SQL cache (default 64, SQL capped at 4,096 bytes; `0` disables)
+
 ## 1.1.0
 
 - Count only rows changed directly by INSERT, UPDATE, and DELETE statements, so trigger writes, virtual table internals, and CREATE TABLE AS SELECT no longer count

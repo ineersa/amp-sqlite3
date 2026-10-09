@@ -92,6 +92,30 @@ final class SqliteConfigTest extends TestCase
         yield [-1];
     }
 
+    #[DataProvider('provideInvalidStatementCacheSizes')]
+    public function testRejectsNegativeStatementCacheSize(int $statementCacheSize): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        (new SqliteConfig(':memory:'))->withStatementCacheSize($statementCacheSize);
+    }
+
+    public static function provideInvalidStatementCacheSizes(): iterable
+    {
+        yield [-1];
+        yield [PHP_INT_MIN];
+    }
+
+    public function testStatementCacheSizeDefaultsAndIsImmutable(): void
+    {
+        $config = new SqliteConfig(':memory:');
+        $changed = $config->withStatementCacheSize(0);
+
+        self::assertSame(64, $config->getStatementCacheSize());
+        self::assertSame(0, $changed->getStatementCacheSize());
+        self::assertSame(64, $config->getStatementCacheSize());
+    }
+
     #[DataProvider('provideInvalidPragmaNames')]
     public function testRejectsInvalidPragmaName(string $name): void
     {

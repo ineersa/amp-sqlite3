@@ -29,13 +29,16 @@ final class WorkerProcess
     private const SQLITE_BUSY = 5;
     private const ROW_PRODUCING_DML_CACHE_SIZE = 256;
     private const ROW_PRODUCING_DML_CACHE_MAX_SQL_LENGTH = 4096;
+    private const STATEMENT_CACHE_MAX_SQL_LENGTH = 4096;
 
     private readonly \SQLite3 $database;
     private readonly int $batchSize;
+    private readonly ImplicitStatementCache $statementCache;
     private bool $closed = false;
     private int $nextBlobId = 1;
     private int $nextResultId = 1;
     private int $nextStatementId = 1;
+    private int $userStatementPreparations = 0;
 
     /** @var array<int, resource> */
     private array $blobs = [];
@@ -60,7 +63,7 @@ final class WorkerProcess
     /** @var array<string, bool> */
     private array $rowProducingDml = [];
 
-    /** @var array<int, array{result: \SQLite3Result, statement: \SQLite3Stmt, statement_id: int|null, pending: SqliteRow|null}> */
+    /** @var array<int, array{result: \SQLite3Result, statement: \SQLite3Stmt, statement_id: int|null, cache_key: string|null, pending: SqliteRow|null}> */
     private array $results = [];
 
     /**
@@ -78,6 +81,8 @@ final class WorkerProcess
             || $open['busy_timeout'] < 0
             || !\is_int($open['batch_size'] ?? null)
             || $open['batch_size'] < 1
+            || !\is_int($open['statement_cache_size'] ?? null)
+            || $open['statement_cache_size'] < 0
             || !\is_bool($open['trusted_schema'] ?? null)
             || !\is_bool($open['extended_result_codes'] ?? null)
             || !self::isPragmaMap($open['pragmas'] ?? null)
@@ -131,6 +136,7 @@ final class WorkerProcess
         $this->database->enableExtendedResultCodes($open['extended_result_codes']);
         $this->database->busyTimeout($open['busy_timeout']);
         $this->batchSize = $open['batch_size'];
+        $this->statementCache = new ImplicitStatementCache($open['statement_cache_size']);
 
         $this->applyPragma('trusted_schema', $open['trusted_schema']);
         $this->applyPragma('foreign_keys', $open['foreign_keys']);
@@ -185,6 +191,17 @@ final class WorkerProcess
     public function getLastExtendedErrorCode(): int
     {
         return $this->database->lastExtendedErrorCode();
+    }
+
+    /**
+     * Counts native preparations performed for public prepare() and direct execute/query misses.
+     *
+     * Cache hits do not increment this counter. It is a worker-local diagnostic for tests, not a
+     * general telemetry channel.
+     */
+    public function getUserStatementPreparations(): int
+    {
+        return $this->userStatementPreparations;
     }
 
     private static function isPragmaMap(mixed $value): bool
@@ -367,6 +384,7 @@ final class WorkerProcess
         foreach ($this->internalStatements as $statement) {
             $statement->close();
         }
+        $this->statementCache->flush();
         $this->database->close();
     }
 
@@ -403,6 +421,8 @@ final class WorkerProcess
         } finally {
             $source->close();
         }
+
+        $this->flushImplicitStatements();
 
         return null;
     }
@@ -552,6 +572,7 @@ final class WorkerProcess
     {
         // Scripts may attach or detach databases
         $this->ordinaryRowIdTables = [];
+        $this->flushImplicitStatements();
         $this->database->exec('BEGIN ' . $transactionMode);
 
         try {
@@ -601,75 +622,108 @@ final class WorkerProcess
     private function execute(array $request, ?int $statementId = null): array
     {
         $lastInsertIdBefore = $this->database->lastInsertRowID();
-        if ($statementId !== null) {
-            if (!isset($this->statements[$statementId])) {
-                throw new ProtocolError("Unknown statement ID '{$statementId}'");
+        $sql = null;
+        $cacheKey = null;
+        $owned = false;
+        $statement = null;
+
+        try {
+            if ($statementId !== null) {
+                if (!isset($this->statements[$statementId])) {
+                    throw new ProtocolError("Unknown statement ID '{$statementId}'");
+                }
+                $statement = $this->statements[$statementId];
+                $this->resetStatement($statement);
+                $this->assertExecutable($statement);
+            } else {
+                $sql = self::requireSql($request);
+                $statement = $this->statementCache->borrow($sql);
+                if ($statement !== null) {
+                    $owned = true;
+                    $cacheKey = $sql;
+                    $this->resetStatement($statement);
+                } else {
+                    $statement = $this->prepareSingleStatement($sql, 'Only one SQL statement may be executed at a time');
+                    $owned = true;
+                    if ($this->isCacheableSql($sql)) {
+                        $cacheKey = $sql;
+                    }
+                }
+                $this->assertExecutable($statement);
             }
-            $statement = $this->statements[$statementId];
-            $statement->clear();
+
+            $this->bindParameters($statement, $request);
+
+            $nativeResult = $this->executeStatement($statement);
+            if ($this->statementInfo[$statement]['metadata']['attach'] ?? false) {
+                $this->ordinaryRowIdTables = [];
+                $this->flushImplicitStatements();
+            }
+            if ($sql !== null && $this->flushesImplicitStatements($sql)) {
+                $this->flushImplicitStatements();
+            }
+            $columns = $nativeResult->numColumns();
+            $value = [
+                'result_id' => null,
+                'rows' => [],
+                'exhausted' => true,
+                'row_count' => null,
+                'column_count' => $columns ?: null,
+                'column_names' => null,
+                'last_insert_id' => null,
+            ];
+
+            if ($columns === 0) {
+                $value['row_count'] = self::isDml($statement) ? $this->database->changes() : 0;
+                $value['last_insert_id'] = $this->detectLastInsertId($statement, $lastInsertIdBefore);
+                $nativeResult->finalize();
+                if ($owned) {
+                    $this->releaseImplicitStatement($statement, $cacheKey);
+                    $owned = false;
+                }
+
+                return $value;
+            }
+
+            $columnNames = [];
+            for ($column = 0; $column < $columns; ++$column) {
+                $columnNames[] = $nativeResult->columnName($column);
+            }
+            $value['column_names'] = $columnNames;
+
+            $resultId = $this->nextResultId++;
+            $this->results[$resultId] = [
+                'result' => $nativeResult,
+                'statement' => $statement,
+                'statement_id' => $statementId,
+                'cache_key' => $owned ? $cacheKey : null,
+                'pending' => null,
+            ];
+            $owned = false;
             try {
-                $statement->reset();
-            } catch (\Throwable) {
-                $statement->reset();
+                $batch = $this->fetchBatch($resultId);
+            } catch (\Throwable $exception) {
+                $this->closeNativeResult($this->results[$resultId]);
+                unset($this->results[$resultId]);
+
+                throw $exception;
             }
-            $this->assertExecutable($statement);
-        } else {
-            $statement = $this->prepareSingleStatement(self::requireSql($request), 'Only one SQL statement may be executed at a time');
-        }
-
-        $this->bindParameters($statement, $request);
-
-        $nativeResult = $this->executeStatement($statement);
-        if ($this->statementInfo[$statement]['metadata']['attach'] ?? false) {
-            $this->ordinaryRowIdTables = [];
-        }
-        $columns = $nativeResult->numColumns();
-        $value = [
-            'result_id' => null,
-            'rows' => [],
-            'exhausted' => true,
-            'row_count' => null,
-            'column_count' => $columns ?: null,
-            'column_names' => null,
-            'last_insert_id' => null,
-        ];
-
-        if ($columns === 0) {
-            $value['row_count'] = self::isDml($statement) ? $this->database->changes() : 0;
-            $value['last_insert_id'] = $this->detectLastInsertId($statement, $lastInsertIdBefore);
-            $nativeResult->finalize();
-            if ($statementId === null) {
-                $statement->close();
+            $value['result_id'] = $resultId;
+            $value['rows'] = $batch['rows'];
+            $value['exhausted'] = $batch['exhausted'];
+            if ($batch['exhausted']) {
+                $this->closeNativeResult($this->results[$resultId]);
+                unset($this->results[$resultId]);
             }
 
             return $value;
-        }
-
-        $columnNames = [];
-        for ($column = 0; $column < $columns; ++$column) {
-            $columnNames[] = $nativeResult->columnName($column);
-        }
-        $value['column_names'] = $columnNames;
-
-        $resultId = $this->nextResultId++;
-        $this->results[$resultId] = ['result' => $nativeResult, 'statement' => $statement, 'statement_id' => $statementId, 'pending' => null];
-        try {
-            $batch = $this->fetchBatch($resultId);
         } catch (\Throwable $exception) {
-            $this->closeNativeResult($this->results[$resultId]);
-            unset($this->results[$resultId]);
+            if ($owned && $statement !== null) {
+                $this->discardImplicitStatement($statement);
+            }
 
             throw $exception;
         }
-        $value['result_id'] = $resultId;
-        $value['rows'] = $batch['rows'];
-        $value['exhausted'] = $batch['exhausted'];
-        if ($batch['exhausted']) {
-            $this->closeNativeResult($this->results[$resultId]);
-            unset($this->results[$resultId]);
-        }
-
-        return $value;
     }
 
     /**
@@ -752,18 +806,92 @@ final class WorkerProcess
     }
 
     /**
-     * @param array{result: \SQLite3Result, statement: \SQLite3Stmt, statement_id: int|null, pending: SqliteRow|null} $resource
+     * @param array{result: \SQLite3Result, statement: \SQLite3Stmt, statement_id: int|null, cache_key: string|null, pending: SqliteRow|null} $resource
      */
     private function closeNativeResult(array $resource): void
     {
         $resource['result']->finalize();
-        if ($resource['statement_id'] === null) {
+        if ($resource['statement_id'] !== null) {
+            return;
+        }
+
+        if (\array_key_exists('cache_key', $resource) && $resource['cache_key'] !== null) {
+            $this->releaseImplicitStatement($resource['statement'], $resource['cache_key']);
+        } else {
             $resource['statement']->close();
         }
     }
 
+    private function resetStatement(\SQLite3Stmt $statement): void
+    {
+        $statement->clear();
+        try {
+            $statement->reset();
+        } catch (\Throwable) {
+            $statement->reset();
+        }
+    }
+
+    private function releaseImplicitStatement(\SQLite3Stmt $statement, ?string $cacheKey): void
+    {
+        try {
+            $this->resetStatement($statement);
+        } catch (\Throwable) {
+            $statement->close();
+
+            return;
+        }
+
+        if ($cacheKey === null) {
+            $statement->close();
+
+            return;
+        }
+
+        $this->statementCache->put($cacheKey, $statement);
+    }
+
+    private function discardImplicitStatement(\SQLite3Stmt $statement): void
+    {
+        try {
+            $statement->close();
+        } catch (\Throwable) {
+        }
+    }
+
+    private function flushImplicitStatements(): void
+    {
+        $this->statementCache->flush();
+    }
+
+    private function isCacheableSql(string $sql): bool
+    {
+        if (\strlen($sql) > self::STATEMENT_CACHE_MAX_SQL_LENGTH) {
+            return false;
+        }
+
+        return SqlStatementBoundary::startsWithKeyword($sql, 'SELECT', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE', 'WITH');
+    }
+
+    private function flushesImplicitStatements(string $sql): bool
+    {
+        return SqlStatementBoundary::startsWithKeyword(
+            $sql,
+            'PRAGMA',
+            'ATTACH',
+            'DETACH',
+            'ALTER',
+            'CREATE',
+            'DROP',
+            'VACUUM',
+            'REINDEX',
+            'ANALYZE',
+        );
+    }
+
     private function prepareSingleStatement(string $sql, string $error): \SQLite3Stmt
     {
+        ++$this->userStatementPreparations;
         [$statement, $metadata] = $this->captureMetadata(fn (): \SQLite3Stmt|false => $this->database->prepare($sql));
         if (!$statement) {
             throw new \RuntimeException('SQL must contain an executable statement');
