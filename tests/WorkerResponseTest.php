@@ -40,6 +40,32 @@ final class WorkerResponseTest extends TestCase
         }
     }
 
+    public function testUnwrapsQueryErrorUsingItsFailingPhase(): void
+    {
+        try {
+            WorkerResponse::unwrap(['id' => 1, 'query_error' => ['message' => 'commit failed', 'query' => 'COMMIT', 'code' => null, 'extended_code' => null]], 1, 'INSERT INTO t VALUES (1)');
+            self::fail('Expected the phase-specific query error');
+        } catch (SqliteQueryError $error) {
+            self::assertSame('COMMIT', $error->getQuery());
+            self::assertNull($error->getResultCode());
+            self::assertNull($error->getExtendedResultCode());
+        }
+    }
+
+    #[DataProvider('invalidQueryFields')]
+    public function testRejectsNonStringFailingQuery(mixed $query): void
+    {
+        $this->expectException(WorkerFailure::class);
+        WorkerResponse::unwrap(['id' => 1, 'query_error' => ['message' => 'commit failed', 'query' => $query, 'code' => null, 'extended_code' => null]], 1, 'INSERT INTO t VALUES (1)');
+    }
+
+    public static function invalidQueryFields(): iterable
+    {
+        yield 'null' => [null];
+        yield 'number' => [1];
+        yield 'array' => [[]];
+    }
+
     public function testUnwrapsOperationError(): void
     {
         $this->expectException(SqliteException::class);

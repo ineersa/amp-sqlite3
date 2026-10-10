@@ -14,6 +14,7 @@ declare(strict_types=1);
 namespace Fabpot\Amp\Sqlite\Internal;
 
 use Amp\Sync\Channel;
+use Fabpot\Amp\Sqlite\SqliteQueryError;
 
 return static function (Channel $channel): null {
     $worker = new WorkerProcess($channel->receive());
@@ -51,6 +52,16 @@ return static function (Channel $channel): null {
             ]);
 
             break;
+        } catch (SqliteQueryError $exception) {
+            $channel->send([
+                'id' => $id,
+                'query_error' => [
+                    'message' => $exception->getMessage(),
+                    'query' => $exception->getQuery(),
+                    'code' => $exception->getResultCode(),
+                    'extended_code' => $exception->getExtendedResultCode(),
+                ],
+            ]);
         } catch (\SQLite3Exception $exception) {
             if ($isQueryOperation) {
                 $channel->send([

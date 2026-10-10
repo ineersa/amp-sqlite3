@@ -17,6 +17,7 @@ use Fabpot\Amp\Sqlite\SqliteBlob;
 use Fabpot\Amp\Sqlite\SqliteBlobMode;
 use Fabpot\Amp\Sqlite\SqliteJournalMode;
 use Fabpot\Amp\Sqlite\SqliteOpenMode;
+use Fabpot\Amp\Sqlite\SqliteQueryError;
 use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 
 /**
@@ -27,6 +28,8 @@ use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 final class WorkerProcess
 {
     private const SQLITE_BUSY = 5;
+    // SQLite stores the primary result code in the low byte of an extended code.
+    private const SQLITE_PRIMARY_CODE_MASK = 0xFF;
     private const ROW_PRODUCING_DML_CACHE_SIZE = 256;
     private const ROW_PRODUCING_DML_CACHE_MAX_SQL_LENGTH = 4096;
     private const STATEMENT_CACHE_MAX_SQL_LENGTH = 4096;
@@ -644,9 +647,13 @@ final class WorkerProcess
         }
         $id = $value['last_insert_id'];
         if (!\is_int($id) || $id <= 0) {
-            throw new \SQLite3Exception('Insert must produce a positive native insert ID before COMMIT');
+            throw new \RuntimeException('Insert must produce a positive native insert ID before COMMIT');
         }
-        $this->database->exec('COMMIT');
+        try {
+            $this->database->exec('COMMIT');
+        } catch (\SQLite3Exception $exception) {
+            throw new SqliteQueryError($exception->getMessage(), 'COMMIT', $exception->getCode() & self::SQLITE_PRIMARY_CODE_MASK, $this->database->lastExtendedErrorCode(), $exception);
+        }
 
         return $id;
     }

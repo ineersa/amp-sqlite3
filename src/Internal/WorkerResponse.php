@@ -47,7 +47,7 @@ final class WorkerResponse
         if (\array_key_exists('query_error', $response)) {
             $error = $response['query_error'];
             if (!\is_array($error)
-                || \count($error) !== 3
+                || \count($error) !== (\array_key_exists('query', $error) ? 4 : 3)
                 || !\is_string($error['message'] ?? null)
                 || !\array_key_exists('code', $error)
                 || ($error['code'] !== null && !\is_int($error['code']))
@@ -55,6 +55,13 @@ final class WorkerResponse
                 || ($error['extended_code'] !== null && !\is_int($error['extended_code']))
             ) {
                 self::invalid();
+            }
+
+            if (\array_key_exists('query', $error)) {
+                if (!\is_string($error['query'])) {
+                    self::invalid();
+                }
+                $sql = $error['query'];
             }
 
             throw new SqliteQueryError($error['message'], $sql, $error['code'], $error['extended_code']);

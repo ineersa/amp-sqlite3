@@ -26,6 +26,10 @@ use PHPUnit\Framework\TestCase;
 
 final class InsertAndCommitTest extends TestCase
 {
+    private const SQLITE_CONSTRAINT = 19;
+    private const SQLITE_CONSTRAINT_UNIQUE = 2067;
+    private const SQLITE_CONSTRAINT_FOREIGNKEY = 787;
+
     private SqliteConnection $connection;
 
     protected function setUp(): void
@@ -83,14 +87,27 @@ final class InsertAndCommitTest extends TestCase
     {
         $transaction = $this->connection->beginTransaction();
         self::assertInstanceOf(Transaction::class, $transaction);
+        $successCalls = 0;
+        $rollbackSeen = new DeferredFuture();
+        $transaction->onCommit(static function () use (&$successCalls): void {
+            ++$successCalls;
+        });
+        $transaction->onRollback(static function () use ($rollbackSeen): void {
+            $rollbackSeen->complete();
+        });
         $transaction->execute('INSERT INTO entries VALUES (?)', ['pending'])->close();
         try {
             $transaction->executeInsertAndCommit('INSERT INTO entries VALUES (?)', ['pending']);
             self::fail('Duplicate insert must fail');
-        } catch (SqliteQueryError) {
+        } catch (SqliteQueryError $error) {
+            self::assertSame('INSERT INTO entries VALUES (?)', $error->getQuery());
+            self::assertSame(self::SQLITE_CONSTRAINT, $error->getResultCode());
+            self::assertSame(self::SQLITE_CONSTRAINT_UNIQUE, $error->getExtendedResultCode());
             self::assertTrue($transaction->isActive());
             $transaction->rollback();
         }
+        $rollbackSeen->getFuture()->await();
+        self::assertSame(0, $successCalls);
         self::assertSame([], \iterator_to_array($this->connection->query('SELECT value FROM entries')));
     }
 
@@ -99,15 +116,28 @@ final class InsertAndCommitTest extends TestCase
     {
         $transaction = $this->connection->beginTransaction();
         self::assertInstanceOf(Transaction::class, $transaction);
+        $successCalls = 0;
+        $rollbackSeen = new DeferredFuture();
+        $transaction->onCommit(static function () use (&$successCalls): void {
+            ++$successCalls;
+        });
+        $transaction->onRollback(static function () use ($rollbackSeen): void {
+            $rollbackSeen->complete();
+        });
         $transaction->execute('INSERT INTO entries VALUES (?)', ['pending'])->close();
         try {
             $transaction->executeInsertAndCommit($sql, []);
             self::fail('Missing or non-positive insert ID must fail');
         } catch (SqliteQueryError $error) {
             self::assertStringContainsString('positive native insert ID', $error->getMessage());
+            self::assertSame($sql, $error->getQuery());
+            self::assertNull($error->getResultCode());
+            self::assertNull($error->getExtendedResultCode());
             self::assertTrue($transaction->isActive());
             $transaction->rollback();
         }
+        $rollbackSeen->getFuture()->await();
+        self::assertSame(0, $successCalls);
         self::assertSame([], \iterator_to_array($this->connection->query('SELECT value FROM entries')));
     }
 
@@ -124,13 +154,26 @@ final class InsertAndCommitTest extends TestCase
         $this->connection->executeScript('CREATE TABLE parents (id INTEGER PRIMARY KEY); CREATE TABLE children (parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)');
         $transaction = $this->connection->beginTransaction();
         self::assertInstanceOf(Transaction::class, $transaction);
+        $successCalls = 0;
+        $rollbackSeen = new DeferredFuture();
+        $transaction->onCommit(static function () use (&$successCalls): void {
+            ++$successCalls;
+        });
+        $transaction->onRollback(static function () use ($rollbackSeen): void {
+            $rollbackSeen->complete();
+        });
         try {
             $transaction->executeInsertAndCommit('INSERT INTO children VALUES (?)', [1]);
             self::fail('Deferred foreign key must reject COMMIT');
-        } catch (SqliteQueryError) {
+        } catch (SqliteQueryError $error) {
+            self::assertSame('COMMIT', $error->getQuery());
+            self::assertSame(self::SQLITE_CONSTRAINT, $error->getResultCode());
+            self::assertSame(self::SQLITE_CONSTRAINT_FOREIGNKEY, $error->getExtendedResultCode());
             self::assertTrue($transaction->isActive());
             $transaction->rollback();
         }
+        $rollbackSeen->getFuture()->await();
+        self::assertSame(0, $successCalls);
         self::assertSame([], \iterator_to_array($this->connection->query('SELECT parent_id FROM children')));
     }
 
