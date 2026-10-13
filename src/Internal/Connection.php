@@ -22,7 +22,6 @@ use Amp\Sync\Lock;
 use Fabpot\Amp\Sqlite\SqliteBlob;
 use Fabpot\Amp\Sqlite\SqliteBlobMode;
 use Fabpot\Amp\Sqlite\SqliteBlobStream;
-use Fabpot\Amp\Sqlite\SqliteCancellableConnection;
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnectionException;
 use Fabpot\Amp\Sqlite\SqliteException;
@@ -34,7 +33,7 @@ use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 use Revolt\EventLoop;
 
 /** @internal */
-final class Connection implements SqliteCancellableConnection
+final class Connection implements \Fabpot\Amp\Sqlite\SqliteWorkerOperationConnection
 {
     use ForbidCloning;
     use ForbidSerialization;
@@ -50,6 +49,9 @@ final class Connection implements SqliteCancellableConnection
 
     /** @var \WeakMap<BlobStream, true> */
     private \WeakMap $blobs;
+
+    /** @var \WeakMap<\Fabpot\Amp\Sqlite\Worker\OperationExecutor, true> */
+    private readonly \WeakMap $operationExecutors;
 
     private SqliteTransactionMode $transactionMode;
     private bool $closed = false;
@@ -72,6 +74,52 @@ final class Connection implements SqliteCancellableConnection
         $blobs = new \WeakMap();
         $this->blobs = $blobs;
         $this->transactionMode = $config->getTransactionMode();
+        $this->operationExecutors = new \WeakMap();
+    }
+
+    public function createWorkerOperationExecutor(int $maximumResultBytes, int $maximumRows): \Fabpot\Amp\Sqlite\Worker\OperationExecutor
+    {
+        if ($maximumResultBytes < 1) {
+            throw new \InvalidArgumentException('Worker operation result byte limit must be positive');
+        }
+        if ($maximumRows < 1) {
+            throw new \InvalidArgumentException('Worker operation row limit must be positive');
+        }
+        if ($this->activeTransaction?->get()?->isActive() === true) {
+            throw new SqliteTransactionError('Finish the legacy transaction before acquiring a worker operation executor');
+        }
+        if ($this->leases->isBusy()) {
+            throw new SqliteTransactionError('Finish legacy requests and unread resources before acquiring a worker operation executor');
+        }
+        $this->assertCurrentTaskHoldsNoTransactionLease();
+        $ownership = $this->acquireConnectionLock();
+        $executor = new \Fabpot\Amp\Sqlite\Worker\OperationExecutor(
+            $ownership,
+            $this->config->getWorkerOperations(),
+            function (string $operation, array $parameters, \Fabpot\Amp\Sqlite\Worker\Mode $mode) use ($maximumResultBytes, $maximumRows): \Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO {
+                $this->assertOpen();
+                try {
+                    $value = $this->channel->request('executeWorkerOperation', '', [
+                        'name' => $operation,
+                        'params' => $parameters,
+                        'mode' => $mode->value,
+                        'maximum_result_bytes' => $maximumResultBytes,
+                        'maximum_rows' => $maximumRows,
+                    ]);
+
+                    return WorkerResponse::operation($value, $maximumResultBytes, $mode);
+                } catch (UnusableOperationException $failure) {
+                    $this->closed = true;
+                    $this->forceClose();
+                    throw $failure;
+                } catch (WorkerFailure $failure) {
+                    $this->fail($failure);
+                }
+            },
+        );
+        $this->operationExecutors[$executor] = true;
+
+        return $executor;
     }
 
     public function __destruct()
@@ -625,6 +673,11 @@ final class Connection implements SqliteCancellableConnection
 
     private function acquireConnectionLock(): Lock
     {
+        foreach ($this->operationExecutors as $executor => $_) {
+            if ($executor->ownsConnection()) {
+                throw new SqliteTransactionError('A worker operation executor owns the connection');
+            }
+        }
         $lock = $this->leases->acquireConnection();
         if ($this->closed) {
             $lock->release();
@@ -661,6 +714,9 @@ final class Connection implements SqliteCancellableConnection
 
     private function closeDependents(): void
     {
+        foreach ($this->operationExecutors as $executor => $_) {
+            $executor->closeOnConnectionClose();
+        }
         foreach ($this->results as $result => $_) {
             try {
                 $result->closeOnConnectionClose();

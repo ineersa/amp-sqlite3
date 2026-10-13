@@ -41,7 +41,7 @@ final class SqliteConnector implements SqlConnector
     /**
      * @param SqliteConfig $config
      */
-    public function connect(SqlConfig $config, ?Cancellation $cancellation = null): SqliteCancellableConnection
+    public function connect(SqlConfig $config, ?Cancellation $cancellation = null): SqliteWorkerOperationConnection
     {
         if (!$config instanceof SqliteConfig) {
             throw new \TypeError('SqliteConnector expects an instance of SqliteConfig');
@@ -77,6 +77,7 @@ final class SqliteConnector implements SqlConnector
                 'functions' => $config->getFunctions(),
                 'aggregates' => $config->getAggregates(),
                 'collations' => $config->getCollations(),
+                'worker_operations' => $config->getWorkerOperations(),
             ]);
             $ready = $context->receive($cancellation);
 

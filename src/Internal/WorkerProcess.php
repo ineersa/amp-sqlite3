@@ -27,6 +27,7 @@ use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 final class WorkerProcess
 {
     private const SQLITE_BUSY = 5;
+    private const SQLITE_PRIMARY_CODE_MASK = 0xFF;
     private const ROW_PRODUCING_DML_CACHE_SIZE = 256;
     private const ROW_PRODUCING_DML_CACHE_MAX_SQL_LENGTH = 4096;
     private const STATEMENT_CACHE_MAX_SQL_LENGTH = 4096;
@@ -34,6 +35,8 @@ final class WorkerProcess
     private readonly \SQLite3 $database;
     private readonly int $batchSize;
     private readonly ImplicitStatementCache $statementCache;
+    /** @var array<string, class-string<\Fabpot\Amp\Sqlite\Worker\Operation>> */
+    private readonly array $workerOperations;
     private bool $closed = false;
     private int $nextBlobId = 1;
     private int $nextResultId = 1;
@@ -90,6 +93,7 @@ final class WorkerProcess
             || !self::isFunctionMap($open['functions'] ?? null)
             || !self::isAggregateMap($open['aggregates'] ?? null)
             || !self::isCollationMap($open['collations'] ?? null)
+            || !self::isOperationMap($open['worker_operations'] ?? [])
         ) {
             throw new ProtocolError('Invalid SQLite startup payload');
         }
@@ -108,6 +112,7 @@ final class WorkerProcess
     public function __construct(#[\SensitiveParameter] mixed $open)
     {
         $open = self::validateOpen($open);
+        $this->workerOperations = $open['worker_operations'] ?? [];
 
         if (!\extension_loaded('sqlite3')) {
             throw new \RuntimeException('The sqlite3 extension is not loaded');
@@ -181,6 +186,7 @@ final class WorkerProcess
                 self::requireTransactionMode($request),
             ),
             'executeControl' => $this->executeControl($request),
+            'executeWorkerOperation' => $this->executeWorkerOperation($request),
             default => throw new ProtocolError("Unknown operation '{$operation}'"),
         };
     }
@@ -209,6 +215,18 @@ final class WorkerProcess
     public function getUserStatementPreparations(): int
     {
         return $this->userStatementPreparations;
+    }
+
+    private static function isOperationMap(mixed $value): bool
+    {
+        return \is_array($value) && \array_all(
+            $value,
+            static fn (mixed $implementation, int|string $name): bool => \is_string($name)
+                && $name !== ''
+                && \is_string($implementation)
+                && \class_exists($implementation)
+                && \is_a($implementation, \Fabpot\Amp\Sqlite\Worker\Operation::class, true),
+        );
     }
 
     private static function isPragmaMap(mixed $value): bool
@@ -633,7 +651,139 @@ final class WorkerProcess
 
     /**
      * @param array<string, mixed> $request
+     * @return array{outcome: string, data: array<array-key, mixed>}
      */
+    private function executeWorkerOperation(array $request): array
+    {
+        $name = self::requireString($request, 'name');
+        if (!isset($this->workerOperations[$name])) {
+            throw new ProtocolError('Worker operation is not registered');
+        }
+        $mode = \Fabpot\Amp\Sqlite\Worker\Mode::tryFrom(self::requireString($request, 'mode'));
+        if ($mode === null) {
+            throw new ProtocolError('Invalid worker operation mode');
+        }
+        $maximumBytes = self::requirePositiveInt($request, 'maximum_result_bytes');
+        $maximumRows = self::requirePositiveInt($request, 'maximum_rows');
+        $parameters = $request['params'] ?? null;
+        if (!\is_array($parameters)) {
+            throw new ProtocolError('Worker operation parameters must be an array');
+        }
+        OperationValues::validate($parameters);
+        $sql = new \Fabpot\Amp\Sqlite\Worker\SqlExecutor(
+            fn (string $statement, array $bindings): array => $this->executeWorkerSql($statement, $bindings, $mode, $maximumRows, $maximumBytes),
+        );
+        if ($mode === \Fabpot\Amp\Sqlite\Worker\Mode::Transaction) {
+            $this->workerControl('BEGIN IMMEDIATE');
+        }
+        try {
+            $operation = $this->workerOperations[$name]::create($sql);
+            $result = $operation->run($parameters);
+            if (($mode === \Fabpot\Amp\Sqlite\Worker\Mode::ReadOnly) !== ($result->outcome === \Fabpot\Amp\Sqlite\Worker\Outcome::ReadOnly)) {
+                throw new \LogicException('Worker operation outcome does not match its mode');
+            }
+            $reply = ['outcome' => $result->outcome->value, 'data' => $result->data];
+            OperationValues::bound($reply, $maximumBytes);
+            $sql->close();
+            if ($mode === \Fabpot\Amp\Sqlite\Worker\Mode::Transaction) {
+                $this->workerControl($result->outcome === \Fabpot\Amp\Sqlite\Worker\Outcome::Commit ? 'COMMIT' : 'ROLLBACK');
+            }
+
+            return $reply;
+        } catch (\Throwable $exception) {
+            $failure = $exception instanceof WorkerOperationException
+                ? $exception
+                : new WorkerOperationException('', null, null, $exception);
+            if ($mode === \Fabpot\Amp\Sqlite\Worker\Mode::Transaction) {
+                try {
+                    $this->database->exec('ROLLBACK');
+                } catch (\Throwable $rollbackFailure) {
+                    $cleanupFailures = [$this->workerFailure('ROLLBACK', $rollbackFailure)];
+                    try {
+                        $this->shutdown();
+                    } catch (\Throwable $closeFailure) {
+                        $cleanupFailures[] = $this->workerFailure('CLOSE CONNECTION', $closeFailure);
+                    }
+                    throw new WorkerOperationException(
+                        $failure->query,
+                        $failure->primaryCode,
+                        $failure->extendedCode,
+                        $failure,
+                        $cleanupFailures,
+                    );
+                }
+            }
+
+            throw $failure;
+        } finally {
+            $sql->close();
+        }
+    }
+
+    /** @param array<array-key, mixed> $parameters
+     * @return array<string, mixed>
+     */
+    private function executeWorkerSql(string $sql, array $parameters, \Fabpot\Amp\Sqlite\Worker\Mode $mode, int $maximumRows, int $maximumBytes): array
+    {
+        try {
+            if (!SqlStatementBoundary::startsWithKeyword($sql, 'SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'REPLACE')) {
+                throw new \InvalidArgumentException('Worker SQL must be one SELECT or DML statement; transaction and configuration control belongs to the driver');
+            }
+            $value = WorkerResponse::result($this->execute([
+                'sql' => $sql,
+                'params' => $parameters,
+                'worker_read_only' => $mode === \Fabpot\Amp\Sqlite\Worker\Mode::ReadOnly,
+            ]));
+            $resultId = $value['result_id'];
+            try {
+                while (true) {
+                    if (\count($value['rows']) > $maximumRows) {
+                        throw new \LengthException('Worker SQL result exceeds its row limit');
+                    }
+                    OperationValues::bound($value, $maximumBytes);
+                    if ($value['exhausted']) {
+                        break;
+                    }
+                    if ($resultId === null) {
+                        throw new \LogicException('An unfinished worker result must have a cursor');
+                    }
+                    $batch = $this->fetch($resultId);
+                    $value['rows'] = [...$value['rows'], ...$batch['rows']];
+                    $value['exhausted'] = $batch['exhausted'];
+                }
+            } finally {
+                if ($resultId !== null) {
+                    $this->closeResult($resultId);
+                }
+            }
+            $value['result_id'] = null;
+
+            return $value;
+        } catch (\Throwable $exception) {
+            throw $this->workerFailure($sql, $exception);
+        }
+    }
+
+    private function workerControl(string $sql): void
+    {
+        try {
+            $this->database->exec($sql);
+        } catch (\Throwable $exception) {
+            throw $this->workerFailure($sql, $exception);
+        }
+    }
+
+    private function workerFailure(string $sql, \Throwable $exception): WorkerOperationException
+    {
+        return new WorkerOperationException(
+            $sql,
+            $exception instanceof \SQLite3Exception ? $exception->getCode() & self::SQLITE_PRIMARY_CODE_MASK : null,
+            $exception instanceof \SQLite3Exception ? $this->database->lastExtendedErrorCode() : null,
+            $exception,
+        );
+    }
+
+    /** @param array<string, mixed> $request */
     private function executeControl(array $request): null
     {
         $this->database->exec(self::controlSql($request));
@@ -696,15 +846,18 @@ final class WorkerProcess
                 $statement = $this->statements[$statementId];
                 $this->resetStatement($statement);
                 $this->assertExecutable($statement);
+                $bindParameters = self::optionalBool($request, 'bind_parameters', true);
+                $parameters = self::requireParameters($request);
             } else {
                 $sql = self::requireSql($request);
-                self::requireParameters($request);
-                self::optionalBool($request, 'bind_parameters', true);
+                $parameters = self::requireParameters($request);
+                $bindParameters = self::optionalBool($request, 'bind_parameters', true);
                 $statement = $this->statementCache->borrow($sql);
                 if ($statement !== null) {
                     $owned = true;
                     $cacheKey = $sql;
-                    $this->resetStatement($statement);
+                    // Idle handles have already been reset and had their bindings cleared on release.
+                    $this->assertExecutable($statement);
                 } else {
                     $statement = $this->prepareSingleStatement($sql, 'Only one SQL statement may be executed at a time');
                     $owned = true;
@@ -712,15 +865,18 @@ final class WorkerProcess
                         $cacheKey = $sql;
                     }
                 }
-                $this->assertExecutable($statement);
             }
 
-            $this->bindParameters($statement, $request);
+            if (self::optionalBool($request, 'worker_read_only', false) && !$statement->readOnly()) {
+                throw new \RuntimeException('Read-only worker operations cannot execute a write statement');
+            }
+            $this->bindParameters($statement, $parameters, $bindParameters);
 
             try {
                 $nativeResult = $this->executeStatement($statement);
             } finally {
-                if ($this->flushesImplicitStatements($sql ?? $statement->getSQL())) {
+                // Cache admission excludes every configuration/schema boundary we must classify here.
+                if ($cacheKey === null && $this->flushesImplicitStatements($sql ?? $statement->getSQL())) {
                     $this->flushImplicitStatements();
                 }
             }
@@ -796,16 +952,15 @@ final class WorkerProcess
     }
 
     /**
-     * @param array<string, mixed> $request
+     * @param array<array-key, SqliteParameterValue> $parameters
      */
-    private function bindParameters(\SQLite3Stmt $statement, array $request): void
+    private function bindParameters(\SQLite3Stmt $statement, array $parameters, bool $bindParameters): void
     {
-        $bindParameters = self::optionalBool($request, 'bind_parameters', true);
         if ($bindParameters === false && $statement->paramCount() > 0) {
             throw new \RuntimeException('Parameters are not allowed in direct queries');
         }
 
-        foreach (self::requireParameters($request) as $key => $value) {
+        foreach ($parameters as $key => $value) {
             $position = \is_int($key) ? $key + 1 : $key;
             $type = match (true) {
                 $value === null => SQLITE3_NULL,
@@ -1195,15 +1350,12 @@ final class WorkerProcess
     }
 
     /**
-     * Reads PRAGMA count_changes with a single-shot querySingle.
-     *
-     * A cached prepare/execute/fetch path is retained for schema_version, where SQLite keeps a reusable
-     * program. count_changes is marked for one execution, so the cached path recompiles on every read.
+     * Reads the live count_changes flag. Retain the cached helper while the single-shot strategy is under review.
      */
     private function countChangesEnabled(): bool
     {
         // Unknown PRAGMA names return null/false. Hard SQL failures still throw SQLite3Exception.
-        return (bool) $this->database->querySingle('PRAGMA count_changes');
+        return (bool) $this->queryInternal('PRAGMA count_changes');
     }
 
     private function detectLastInsertId(\SQLite3Stmt $statement, int $before): ?int

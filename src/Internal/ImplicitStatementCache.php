@@ -17,7 +17,8 @@ namespace Fabpot\Amp\Sqlite\Internal;
  * Bounded idle cache of native statements prepared for direct query/execute calls.
  *
  * Exact SQL bytes are the key. Only idle handles are retained; active results keep ownership
- * until they finalize. Eviction closes the least recently used idle entry.
+ * until they finalize. Handles admitted to the idle cache are reset with bindings cleared first.
+ * Eviction closes the least recently used idle entry.
  *
  * @internal
  */
