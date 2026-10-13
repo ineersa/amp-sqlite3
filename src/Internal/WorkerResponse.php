@@ -47,7 +47,7 @@ final class WorkerResponse
         if (\array_key_exists('query_error', $response)) {
             $error = $response['query_error'];
             if (!\is_array($error)
-                || \count($error) !== 3
+                || \count($error) !== (\array_key_exists('query', $error) ? 4 : 3) + (\array_key_exists('cleanup_errors', $error) ? 1 : 0)
                 || !\is_string($error['message'] ?? null)
                 || !\array_key_exists('code', $error)
                 || ($error['code'] !== null && !\is_int($error['code']))
@@ -55,6 +55,37 @@ final class WorkerResponse
                 || ($error['extended_code'] !== null && !\is_int($error['extended_code']))
             ) {
                 self::invalid();
+            }
+
+            if (\array_key_exists('query', $error)) {
+                if (!\is_string($error['query'])) {
+                    self::invalid();
+                }
+                $sql = $error['query'];
+            }
+
+            if (\array_key_exists('cleanup_errors', $error)) {
+                $diagnostics = $error['cleanup_errors'];
+                if (!\is_array($diagnostics) || !\array_is_list($diagnostics) || $diagnostics === []) {
+                    self::invalid();
+                }
+                // Null marks the end of the secondary diagnostic chain.
+                $previous = null;
+                foreach (\array_reverse($diagnostics) as $diagnostic) {
+                    if (!\is_array($diagnostic)
+                        || \count($diagnostic) !== 4
+                        || !\is_string($diagnostic['message'] ?? null)
+                        || !\is_string($diagnostic['query'] ?? null)
+                        || !\array_key_exists('code', $diagnostic)
+                        || ($diagnostic['code'] !== null && !\is_int($diagnostic['code']))
+                        || !\array_key_exists('extended_code', $diagnostic)
+                        || ($diagnostic['extended_code'] !== null && !\is_int($diagnostic['extended_code']))
+                    ) {
+                        self::invalid();
+                    }
+                    $previous = new SqliteQueryError($diagnostic['message'], $diagnostic['query'], $diagnostic['code'], $diagnostic['extended_code'], $previous);
+                }
+                throw new UnusableOperationException($error['message'], $sql, $error['code'], $error['extended_code'], $previous);
             }
 
             throw new SqliteQueryError($error['message'], $sql, $error['code'], $error['extended_code']);
@@ -79,6 +110,36 @@ final class WorkerResponse
         }
 
         return $response['value'];
+    }
+
+    public static function operation(mixed $value, int $maximumBytes, \Fabpot\Amp\Sqlite\Worker\Mode $mode): \Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO
+    {
+        if (!\is_array($value) || \count($value) !== 2) {
+            self::invalid();
+        }
+        if (!\is_array($value['data'] ?? null)) {
+            self::invalid();
+        }
+        if (!\is_string($value['outcome'] ?? null)) {
+            self::invalid();
+        }
+        $outcome = \Fabpot\Amp\Sqlite\Worker\Outcome::tryFrom($value['outcome']);
+        if ($outcome === null) {
+            self::invalid();
+        }
+        if ($mode === \Fabpot\Amp\Sqlite\Worker\Mode::ReadOnly && $outcome !== \Fabpot\Amp\Sqlite\Worker\Outcome::ReadOnly) {
+            self::invalid();
+        }
+        if ($mode === \Fabpot\Amp\Sqlite\Worker\Mode::Transaction && $outcome === \Fabpot\Amp\Sqlite\Worker\Outcome::ReadOnly) {
+            self::invalid();
+        }
+        try {
+            OperationValues::bound($value, $maximumBytes);
+        } catch (\Throwable $exception) {
+            throw new WorkerFailure('Invalid SQLite worker operation result', previous: $exception);
+        }
+
+        return new \Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO($outcome, $value['data']);
     }
 
     public static function void(mixed $value): void

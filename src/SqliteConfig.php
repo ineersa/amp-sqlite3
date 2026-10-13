@@ -55,6 +55,40 @@ final class SqliteConfig extends SqlConfig
     /** @var array<string, string> */
     private array $collations = [];
 
+    /** Empty by default because worker operations are an opt-in application capability.
+     * @var array<string, class-string<\Fabpot\Amp\Sqlite\Worker\Operation>>
+     */
+    private array $workerOperations = [];
+
+    /** @param array<string, class-string<\Fabpot\Amp\Sqlite\Worker\Operation>> $operations */
+    public function withWorkerOperations(array $operations): self
+    {
+        foreach ($operations as $name => $implementation) {
+            if (!\is_string($name) || $name === '') {
+                throw new \InvalidArgumentException('Worker operation names must be non-empty strings');
+            }
+            if (!\is_string($implementation)) {
+                throw new \InvalidArgumentException('Worker operation implementations must be class names');
+            }
+            if (!\class_exists($implementation)) {
+                throw new \InvalidArgumentException('Worker operation implementation must be an autoloadable class');
+            }
+            if (!\is_a($implementation, \Fabpot\Amp\Sqlite\Worker\Operation::class, true)) {
+                throw new \InvalidArgumentException('Worker operation must implement the operation factory contract');
+            }
+        }
+        $config = clone $this;
+        $config->workerOperations = $operations;
+
+        return $config;
+    }
+
+    /** @return array<string, class-string<\Fabpot\Amp\Sqlite\Worker\Operation>> */
+    public function getWorkerOperations(): array
+    {
+        return $this->workerOperations;
+    }
+
     public function __construct(string $path)
     {
         Path::validate($path);

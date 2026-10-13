@@ -35,11 +35,34 @@ return static function (Channel $channel): null {
             'executeStatement',
             'executeScript',
             'executeControl',
+            'executeWorkerOperation',
         ], true);
 
         try {
             $channel->send(['id' => $id, 'value' => $worker->handle($request)]);
 
+            if ($worker->isClosed()) {
+                return null;
+            }
+        } catch (WorkerOperationException $exception) {
+            $error = [
+                'message' => $exception->getMessage(),
+                'code' => $exception->primaryCode,
+                'extended_code' => $exception->extendedCode,
+                'query' => $exception->query,
+            ];
+            if ($exception->cleanupFailures !== []) {
+                $error['cleanup_errors'] = \array_map(static fn (WorkerOperationException $failure): array => [
+                    'message' => $failure->getMessage(),
+                    'code' => $failure->primaryCode,
+                    'extended_code' => $failure->extendedCode,
+                    'query' => $failure->query,
+                ], $exception->cleanupFailures);
+            }
+            $channel->send([
+                'id' => $id,
+                'query_error' => $error,
+            ]);
             if ($worker->isClosed()) {
                 return null;
             }
