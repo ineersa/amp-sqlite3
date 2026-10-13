@@ -18,6 +18,6 @@ use Fabpot\Amp\Sqlite\Worker\OperationExecutor;
 /** Opt-in capability; ordinary SqliteConnection implementations remain unchanged. */
 interface SqliteWorkerOperationConnection extends SqliteCancellableConnection
 {
-    /** Acquires exclusive connection ownership until the executor closes. */
-    public function createWorkerOperationExecutor(int $maximumResultBytes, int $maximumRows): OperationExecutor;
+    /** Acquires exclusive ownership. Null limits select depth one through the same bounded coordinator. */
+    public function createWorkerOperationExecutor(int $maximumResultBytes, int $maximumRows, ?\Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO $limits = null): OperationExecutor;
 }

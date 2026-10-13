@@ -67,7 +67,7 @@ final class WorkerOperationFaultTest extends TestCase
                 $pages->close();
             }
             $connection->query('PRAGMA max_page_count = ' . $pageCount)->close();
-            $executor = $connection->createWorkerOperationExecutor(self::RESULT_BYTES, self::RESULT_ROWS);
+            $executor = $connection->createWorkerOperationExecutor(self::RESULT_BYTES, self::RESULT_ROWS, new \Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO(4, 256 * 1024, 8, 512 * 1024, 8192));
             $sql = 'INSERT INTO entries (body) VALUES (zeroblob(?))';
             try {
                 $executor->run('sql', ['sql' => $sql, 'bindings' => [self::OVERSIZED_BLOB_BYTES], 'outcome' => Outcome::Commit->value], Mode::Transaction);
@@ -134,7 +134,7 @@ final class WorkerOperationFaultTest extends TestCase
                     self::assertNotNull($socket);
                     $control = new StreamChannel($socket, $socket);
                     try {
-                        $executor = $connection->createWorkerOperationExecutor(self::RESULT_BYTES, self::RESULT_ROWS);
+                        $executor = $connection->createWorkerOperationExecutor(self::RESULT_BYTES, self::RESULT_ROWS, new \Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO(4, 256 * 1024, 8, 512 * 1024, 8192));
                         $confirmations = 0;
                         $future = async(static function () use ($executor, &$confirmations): void {
                             $executor->run('sql', ['sql' => 'UPDATE counter SET value = value + 1', 'bindings' => [], 'outcome' => Outcome::Commit->value], Mode::Transaction);

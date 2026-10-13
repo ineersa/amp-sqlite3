@@ -283,6 +283,7 @@ final class WorkerOperationTest extends TestCase
         self::assertSame("ready\n", $peer->read(new TimeoutCancellation(5)));
         $budget = new DeferredCancellation();
         $closing = async(static fn () => $connection->close($budget->getCancellation()));
+        $budget->cancel();
         try {
             $closing->await(new TimeoutCancellation(5));
             try {

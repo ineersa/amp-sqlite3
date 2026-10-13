@@ -77,7 +77,7 @@ final class Connection implements \Fabpot\Amp\Sqlite\SqliteWorkerOperationConnec
         $this->operationExecutors = new \WeakMap();
     }
 
-    public function createWorkerOperationExecutor(int $maximumResultBytes, int $maximumRows): \Fabpot\Amp\Sqlite\Worker\OperationExecutor
+    public function createWorkerOperationExecutor(int $maximumResultBytes, int $maximumRows, ?\Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO $limits = null): \Fabpot\Amp\Sqlite\Worker\OperationExecutor
     {
         if ($maximumResultBytes < 1) {
             throw new \InvalidArgumentException('Worker operation result byte limit must be positive');
@@ -93,29 +93,28 @@ final class Connection implements \Fabpot\Amp\Sqlite\SqliteWorkerOperationConnec
         }
         $this->assertCurrentTaskHoldsNoTransactionLease();
         $ownership = $this->acquireConnectionLock();
+        $limits ??= \Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO::serial($maximumResultBytes);
+        $pipeline = $this->channel->createPipeline($limits, function (\Throwable $failure): void {
+            $this->closed = true;
+            $this->forceClose();
+        });
         $executor = new \Fabpot\Amp\Sqlite\Worker\OperationExecutor(
             $ownership,
             $this->config->getWorkerOperations(),
-            function (string $operation, array $parameters, \Fabpot\Amp\Sqlite\Worker\Mode $mode) use ($maximumResultBytes, $maximumRows): \Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO {
+            function (string $operation, array $parameters, \Fabpot\Amp\Sqlite\Worker\Mode $mode, int $bytes, Cancellation $cancellation) use ($pipeline, $maximumRows): \Fabpot\Amp\Sqlite\Worker\PendingOperation {
                 $this->assertOpen();
-                try {
-                    $value = $this->channel->request('executeWorkerOperation', '', [
+                return $pipeline->submit([
+                        'operation' => 'executeWorkerOperation',
                         'name' => $operation,
                         'params' => $parameters,
                         'mode' => $mode->value,
-                        'maximum_result_bytes' => $maximumResultBytes,
+                        'maximum_result_bytes' => $bytes,
                         'maximum_rows' => $maximumRows,
-                    ]);
-
-                    return WorkerResponse::operation($value, $maximumResultBytes, $mode);
-                } catch (UnusableOperationException $failure) {
-                    $this->closed = true;
-                    $this->forceClose();
-                    throw $failure;
-                } catch (WorkerFailure $failure) {
-                    $this->fail($failure);
-                }
+                    ], $mode, $bytes, $cancellation);
             },
+            fn () => $pipeline->detach(new \Amp\TimeoutCancellation(WorkerChannel::DEFAULT_CLOSE_TIMEOUT_SECONDS)),
+            $maximumResultBytes,
+            $pipeline->abort(...),
         );
         $this->operationExecutors[$executor] = true;
 
@@ -212,6 +211,21 @@ final class Connection implements \Fabpot\Amp\Sqlite\SqliteWorkerOperationConnec
         }
 
         $this->closed = true;
+
+        if ($this->channel->hasPipeline()) {
+            $this->closeDependents();
+            try {
+                $this->channel->close($cancellation);
+            } catch (\Throwable) {
+                $this->forceClose();
+            } finally {
+                if (!$this->onClose->isComplete()) {
+                    $this->onClose->complete();
+                }
+            }
+
+            return;
+        }
 
         if ($this->leases->isBusy() && !$this->channel->isBusy()) {
             self::awaitQueuedCleanup();

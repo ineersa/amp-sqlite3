@@ -46,6 +46,8 @@ final class WorkerChannel
     private int $nextRequestId = 1;
     private bool $busy = false;
     private int $lastUsedAt;
+    /** @var list<OperationPipeline> Empty until transport ownership transfers to an executor. */
+    private array $pipelines = [];
 
     /**
      * @param Context<null, mixed, array<string, mixed>> $context
@@ -66,6 +68,9 @@ final class WorkerChannel
      */
     public function request(string $operation, string $sql, #[\SensitiveParameter] array $data): mixed
     {
+        if ($this->pipelines !== []) {
+            throw new WorkerFailure('An operation executor exclusively owns the channel');
+        }
         $lock = $this->mutex->acquire();
         $id = $this->nextRequestId++;
         $this->busy = true;
@@ -87,7 +92,27 @@ final class WorkerChannel
 
     public function isBusy(): bool
     {
-        return $this->busy;
+        return $this->busy || ($this->pipelines !== [] && $this->pipelines[0]->isBusy());
+    }
+
+    public function hasPipeline(): bool
+    {
+        return $this->pipelines !== [];
+    }
+
+    public function createPipeline(\Fabpot\Amp\Sqlite\Worker\DTO\PipelineLimitsDTO $limits, \Closure $onFailure): OperationPipeline
+    {
+        if ($this->pipelines !== [] || $this->busy) {
+            throw new WorkerFailure('The channel already has an owner');
+        }
+        $pipeline = new OperationPipeline($this->context, $limits, $this->nextRequestId, function (int $nextId): void {
+            $this->nextRequestId = $nextId;
+            $this->lastUsedAt = $this->pipelines[0]->getLastUsedAt();
+            $this->pipelines = [];
+        }, $onFailure);
+        $this->pipelines[] = $pipeline;
+
+        return $pipeline;
     }
 
     public function isClosed(): bool
@@ -97,7 +122,7 @@ final class WorkerChannel
 
     public function getLastUsedAt(): int
     {
-        return $this->lastUsedAt;
+        return $this->pipelines !== [] ? $this->pipelines[0]->getLastUsedAt() : $this->lastUsedAt;
     }
 
     /**
@@ -113,6 +138,10 @@ final class WorkerChannel
     public function close(?Cancellation $cancellation = null): void
     {
         $budget = self::closeBudget($cancellation);
+        if ($this->pipelines !== []) {
+            $this->pipelines[0]->close($budget);
+            return;
+        }
         $subscription = $budget->subscribe($this->kill(...));
         $lock = null;
 
@@ -151,6 +180,10 @@ final class WorkerChannel
      */
     public function kill(): void
     {
+        if ($this->pipelines !== []) {
+            $this->pipelines[0]->abort();
+            return;
+        }
         if ($this->context->isClosed()) {
             return;
         }

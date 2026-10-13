@@ -13,67 +13,89 @@ declare(strict_types=1);
 
 namespace Fabpot\Amp\Sqlite\Worker;
 
+use Amp\Cancellation;
 use Amp\ForbidCloning;
 use Amp\ForbidSerialization;
+use Amp\NullCancellation;
 use Amp\Sync\Lock;
 use Fabpot\Amp\Sqlite\Internal\OperationValues;
 use Fabpot\Amp\Sqlite\SqliteConnectionException;
 use Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO;
 
-/** Parent-side serial executor with exclusive connection ownership. Close releases that ownership. */
+/** Exclusive connection owner; requests execute through one bounded operation lane. */
 final class OperationExecutor
 {
     use ForbidCloning;
     use ForbidSerialization;
 
     private bool $closed = false;
-    private int $pendingOperations = 0;
     private bool $released = false;
 
     /**
      * @param array<string, class-string<Operation>> $operations
-     * @param \Closure(string, array<array-key, mixed>, Mode): OperationResultDTO $request
-     * @internal Constructed by a connection after acquiring its exclusive lease.
+     * @param \Closure(string, array<array-key, mixed>, Mode, int, Cancellation): PendingOperation $request
+     * @param \Closure(): void $detach
+     * @param \Closure(): void $abort Synchronous cleanup only; used during destruction.
      */
-    public function __construct(
-        private readonly Lock $ownership,
-        private readonly array $operations,
-        private readonly \Closure $request,
-    ) {
+    public function __construct(private readonly Lock $ownership, private readonly array $operations, private readonly \Closure $request, private readonly \Closure $detach, private readonly int $maximumResultBytes, private readonly \Closure $abort)
+    {
     }
 
     public function __destruct()
     {
-        $this->close();
+        if ($this->closed) {
+            return;
+        }
+        $this->closed = true;
+        try {
+            ($this->abort)();
+        } catch (\Throwable) {
+            // Destruction must not suspend or propagate a shutdown failure.
+        } finally {
+            $this->release();
+        }
     }
 
-    /**
+    /** Null budgets select the executor's declared maximum; null cancellation means no caller cancellation.
      * @param array<array-key, mixed> $parameters
      */
-    public function run(string $operation, array $parameters, Mode $mode): OperationResultDTO
+    public function run(string $operation, array $parameters, Mode $mode, ?int $maximumResultBytes = null, ?Cancellation $cancellation = null): OperationResultDTO
     {
+        return $this->submit($operation, $parameters, $mode, $maximumResultBytes, $cancellation)->await();
+    }
+
+    /** Explicit handles retain admission until await/discard, including completed replies.
+     * @param array<array-key, mixed> $parameters
+     */
+    public function submit(string $operation, array $parameters, Mode $mode, ?int $maximumResultBytes = null, ?Cancellation $cancellation = null): PendingOperation
+    {
+        if ($this->closed) {
+            throw new SqliteConnectionException('The worker operation executor is closed');
+        }
         if (!isset($this->operations[$operation])) {
             throw new \InvalidArgumentException('Worker operation is not registered');
         }
         OperationValues::validate($parameters);
-        if ($this->closed) {
-            throw new SqliteConnectionException('The worker operation executor is closed');
+        $bytes = $maximumResultBytes ?? $this->maximumResultBytes;
+        if ($bytes < 1) {
+            throw new \InvalidArgumentException('Result budget must be positive');
         }
-        ++$this->pendingOperations;
-        try {
-            return ($this->request)($operation, $parameters, $mode);
-        } finally {
-            --$this->pendingOperations;
-            if ($this->closed && $this->pendingOperations === 0) {
-                $this->release();
-            }
+        if ($bytes > $this->maximumResultBytes) {
+            throw new \InvalidArgumentException('Result budget exceeds the executor maximum');
         }
+
+        return ($this->request)($operation, $parameters, $mode, $bytes, $cancellation ?? new NullCancellation());
     }
 
     public function close(): void
     {
+        if ($this->closed) {
+            return;
+        }
         $this->closed = true;
-        if ($this->pendingOperations === 0) {
+        try {
+            ($this->detach)();
+        } finally {
             $this->release();
         }
     }
@@ -90,7 +112,6 @@ final class OperationExecutor
         $this->release();
     }
 
-    /** @internal Even a closing executor owns its lease until its active request finishes. */
     public function ownsConnection(): bool
     {
         return !$this->released;
